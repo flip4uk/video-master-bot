@@ -125,20 +125,18 @@ def get_video_url(text: str):
 def download_video(url: str, folder: str):
     output_template = str(Path(folder) / "video.%(ext)s")
 
-    options = {
-        # Сначала MP4 с видео и звуком в одном файле.
-        # Если такого формата нет — лучшие отдельные дорожки,
-        # затем лучший доступный единый формат.
-        "format": "best[ext=mp4]/bestvideo+bestaudio/best",
-        "merge_output_format": "mp4",
-        "outtmpl": output_template,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": False,
-        "socket_timeout": 30,
-        "retries": 3,
-        "fragment_retries": 3,
-        "format_sort": ["res", "ext:mp4:m4a"],
+    
+options = {
+    "outtmpl": str(Path(folder) / "video.%(ext)s"),
+    "noplaylist": True,
+    "quiet": True,
+    "no_warnings": False,
+    "socket_timeout": 30,
+    "retries": 3,
+    "fragment_retries": 3,
+    "merge_output_format": "mp4",
+}
+
     }
 
     with yt_dlp.YoutubeDL(options) as ydl:
