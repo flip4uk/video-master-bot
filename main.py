@@ -112,8 +112,11 @@ def get_video_url(text: str):
     return url
 
 
+
 def download_video(url: str, folder: str):
     options = {
+        # Сначала пробуем MP4, затем любой доступный формат.
+        # Если видео и аудио доступны отдельно, выбираем их вместе.
         "format": "best[ext=mp4]/best",
         "outtmpl": str(Path(folder) / "video.%(ext)s"),
         "noplaylist": True,
@@ -121,7 +124,43 @@ def download_video(url: str, folder: str):
         "no_warnings": True,
         "socket_timeout": 30,
         "retries": 2,
+        "ignoreerrors": False,
     }
+
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+        if not info:
+            raise RuntimeError("Не удалось получить информацию о видео")
+
+        # Выбираем лучший формат из тех, которые реально доступны.
+        formats = info.get("formats") or []
+        available = [
+            f for f in formats
+            if f.get("vcodec") != "none"
+            and f.get("url")
+        ]
+
+        if not available:
+            raise RuntimeError("Для этого видео нет доступного формата")
+
+        mp4_formats = [
+            f for f in available
+            if f.get("ext") == "mp4"
+        ]
+
+        candidates = mp4_formats or available
+        chosen = max(
+            candidates,
+            key=lambda f: (
+                f.get("height") or 0,
+                f.get("tbr") or 0
+            )
+        )
+
+        format_id = chosen["format_id"]
+
+    options["format"] = format_id
 
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -136,6 +175,7 @@ def download_video(url: str, folder: str):
         path = candidates[0]
 
     return path, info.get("title", "Видео")
+
 
 
 async def show_menu(message: Message):
