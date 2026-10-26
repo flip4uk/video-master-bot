@@ -3,7 +3,11 @@ import asyncio
 import logging
 import os
 import re
+import tempfile
+from pathlib import Path
+from urllib.parse import urlparse
 
+import yt_dlp
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.types import (
@@ -11,6 +15,7 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    FSInputFile,
 )
 from aiogram.exceptions import TelegramBadRequest
 
@@ -30,6 +35,20 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
+
+ALLOWED_DOMAINS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "youtu.be",
+    "www.youtu.be",
+    "tiktok.com",
+    "www.tiktok.com",
+    "vm.tiktok.com",
+    "vt.tiktok.com",
+    "instagram.com",
+    "www.instagram.com",
+}
 
 
 def subscription_keyboard():
@@ -68,17 +87,60 @@ async def is_subscribed(user_id: int) -> bool:
             chat_id=CHANNEL_ID,
             user_id=user_id
         )
-        return member.status in ("member", "administrator", "creator")
+        return member.status in (
+            "member", "administrator", "creator"
+        )
     except TelegramBadRequest:
         logging.exception("Не удалось проверить подписку")
         return False
 
 
+def get_video_url(text: str):
+    match = URL_PATTERN.search(text)
+    if not match:
+        return None
+
+    url = match.group(0).rstrip(".,!?;:)]}")
+    parsed = urlparse(url)
+
+    if parsed.scheme not in ("http", "https"):
+        return None
+
+    if parsed.hostname not in ALLOWED_DOMAINS:
+        return None
+
+    return url
+
+
+def download_video(url: str, folder: str):
+    options = {
+        "format": "best[ext=mp4]/best",
+        "outtmpl": str(Path(folder) / "video.%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 30,
+        "retries": 2,
+    }
+
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = ydl.prepare_filename(info)
+
+    path = Path(filename)
+
+    if not path.is_file():
+        candidates = list(Path(folder).glob("video.*"))
+        if not candidates:
+            raise RuntimeError("Загруженный файл не найден")
+        path = candidates[0]
+
+    return path, info.get("title", "Видео")
+
+
 async def show_menu(message: Message):
     await message.answer(
         "👋 Добро пожаловать!\n\n"
-        "Здесь можно будет скачивать видео и "
-        "обрабатывать собственные ролики.\n\n"
         "Выбери нужный раздел:",
         reply_markup=main_keyboard()
     )
@@ -88,7 +150,7 @@ async def show_menu(message: Message):
 async def start(message: Message):
     if not await is_subscribed(message.from_user.id):
         await message.answer(
-            "🔒 Чтобы пользоваться ботом, подпишись на наш канал "
+            "🔒 Чтобы пользоваться ботом, подпишись на канал "
             "и нажми «Проверить подписку».",
             reply_markup=subscription_keyboard()
         )
@@ -117,42 +179,45 @@ async def check_subscription(callback: CallbackQuery):
 @dp.callback_query(F.data == "download")
 async def download_info(callback: CallbackQuery):
     if not await is_subscribed(callback.from_user.id):
-        await callback.answer("Сначала подпишись на канал.", show_alert=True)
+        await callback.answer(
+            "Сначала подпишись на канал.", show_alert=True
+        )
         return
 
     await callback.answer()
     if callback.message:
         await callback.message.answer(
-            "📥 Отправь ссылку на видео из YouTube, TikTok или Instagram.\n\n"
-            "Пока скачивание не подключено — это добавим на следующем этапе."
+            "📥 Отправь ссылку на видео из YouTube, TikTok или Instagram."
         )
 
 
 @dp.callback_query(F.data == "unique")
 async def unique_info(callback: CallbackQuery):
     if not await is_subscribed(callback.from_user.id):
-        await callback.answer("Сначала подпишись на канал.", show_alert=True)
+        await callback.answer(
+            "Сначала подпишись на канал.", show_alert=True
+        )
         return
 
     await callback.answer()
     if callback.message:
         await callback.message.answer(
-            "🎬 Раздел обработки видео готовится.\n"
-            "Планируется создание до 5 вариантов за один запуск."
+            "🎬 Обработка видео будет добавлена следующим этапом."
         )
 
 
 @dp.callback_query(F.data == "donate")
 async def donate_info(callback: CallbackQuery):
     if not await is_subscribed(callback.from_user.id):
-        await callback.answer("Сначала подпишись на канал.", show_alert=True)
+        await callback.answer(
+            "Сначала подпишись на канал.", show_alert=True
+        )
         return
 
     await callback.answer()
     if callback.message:
         await callback.message.answer(
-            "⭐ Спасибо за желание поддержать проект!\n"
-            "Приём Telegram Stars подключим отдельным этапом."
+            "⭐ Приём Telegram Stars подключим отдельным этапом."
         )
 
 
@@ -165,18 +230,51 @@ async def handle_text(message: Message):
         )
         return
 
-    text = message.text or ""
+    url = get_video_url(message.text or "")
 
-    if URL_PATTERN.search(text):
+    if not url:
         await message.answer(
-            "🔗 Ссылка получена. Загрузчик видео подключим "
-            "на следующем этапе."
-        )
-    else:
-        await message.answer(
-            "Выбери раздел в меню или отправь ссылку на видео.",
+            "Отправь корректную ссылку на видео из YouTube, "
+            "TikTok или Instagram.",
             reply_markup=main_keyboard()
         )
+        return
+
+    status = await message.answer(
+        "⏳ Загружаю видео. Это может занять несколько минут..."
+    )
+
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            path, title = await asyncio.to_thread(
+                download_video, url, folder
+            )
+
+            # Ограничение размера для отправки через Telegram Bot API.
+            if path.stat().st_size > 49 * 1024 * 1024:
+                await status.edit_text(
+                    "⚠️ Видео превышает допустимый для этого бота "
+                    "размер отправки (49 МБ). Попробуй видео меньшего размера."
+                )
+                return
+
+            await message.answer_video(
+                video=FSInputFile(path),
+                caption=title[:900]
+            )
+
+        await status.delete()
+
+    except Exception:
+        logging.exception("Ошибка загрузки видео")
+        try:
+            await status.edit_text(
+                "❌ Не удалось скачать это видео.\n\n"
+                "Попробуй другую ссылку. Некоторые ролики недоступны "
+                "без авторизации или ограничены платформой."
+            )
+        except TelegramBadRequest:
+            pass
 
 
 async def main():
