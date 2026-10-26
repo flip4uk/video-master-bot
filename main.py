@@ -14,18 +14,20 @@ from aiogram.types import (
     KeyboardButton,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    FSInputFile,
 )
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
 
-# =========================
+# =====================================
 # НАСТРОЙКИ
-# =========================
+# =====================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 SUBSCRIBE_URL = os.getenv("SUBSCRIBE_URL")
 
+# Ограничиваем размер отправляемого видео примерно 49 МБ.
 MAX_TELEGRAM_FILE_SIZE = 49 * 1024 * 1024
 
 logging.basicConfig(
@@ -44,24 +46,23 @@ if not CHANNEL_ID:
 if not SUBSCRIBE_URL:
     raise RuntimeError("Не задана переменная SUBSCRIBE_URL")
 
-# Если CHANNEL_ID записан числом, преобразуем его.
 try:
     CHANNEL_ID = int(CHANNEL_ID)
 except ValueError:
     pass
 
 
-# =========================
+# =====================================
 # СОЗДАНИЕ БОТА
-# =========================
+# =====================================
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 
-# =========================
-# КНОПКИ
-# =========================
+# =====================================
+# КЛАВИАТУРЫ
+# =====================================
 
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
@@ -90,9 +91,9 @@ subscribe_keyboard = InlineKeyboardMarkup(
 )
 
 
-# =========================
+# =====================================
 # ПРОВЕРКА ПОДПИСКИ
-# =========================
+# =====================================
 
 async def is_subscribed(user_id: int) -> bool:
     try:
@@ -101,28 +102,32 @@ async def is_subscribed(user_id: int) -> bool:
             user_id=user_id,
         )
 
-        return member.status in ("member", "administrator", "creator")
+        return member.status in (
+            "member",
+            "administrator",
+            "creator",
+        )
 
     except (TelegramBadRequest, TelegramForbiddenError) as error:
-        logger.error("Не удалось проверить подписку: %s", error)
+        logger.error("Ошибка проверки подписки: %s", error)
         return False
 
     except Exception:
-        logger.exception("Ошибка при проверке подписки")
+        logger.exception("Не удалось проверить подписку")
         return False
 
 
 async def ask_to_subscribe(message: Message):
     await message.answer(
-        "👋 Для использования VidMorph сначала подпишитесь на наш канал, "
-        "а затем нажмите «Проверить подписку».",
+        "👋 Чтобы пользоваться VidMorph, подпишитесь на канал, "
+        "затем нажмите «Проверить подписку».",
         reply_markup=subscribe_keyboard,
     )
 
 
-# =========================
+# =====================================
 # ПРОВЕРКА ССЫЛКИ
-# =========================
+# =====================================
 
 def get_video_url(text: str):
     text = text.strip()
@@ -136,6 +141,7 @@ def get_video_url(text: str):
         return None
 
     host = (parsed.hostname or "").lower()
+
     allowed_domains = (
         "youtube.com",
         "youtu.be",
@@ -144,17 +150,16 @@ def get_video_url(text: str):
         "tiktok.com",
     )
 
-    is_supported = any(
-        host == domain or host.endswith("." + domain)
-        for domain in allowed_domains
-    )
+    for domain in allowed_domains:
+        if host == domain or host.endswith("." + domain):
+            return text
 
-    return text if is_supported else None
+    return None
 
 
-# =========================
+# =====================================
 # СКАЧИВАНИЕ ВИДЕО
-# =========================
+# =====================================
 
 def download_video(url: str, folder: str):
     output_template = str(Path(folder) / "video.%(ext)s")
@@ -168,7 +173,6 @@ def download_video(url: str, folder: str):
         "retries": 3,
         "fragment_retries": 3,
         "merge_output_format": "mp4",
-        # Не задаём жёсткий формат: yt-dlp выберет доступный.
     }
 
     with yt_dlp.YoutubeDL(options) as ydl:
@@ -181,7 +185,7 @@ def download_video(url: str, folder: str):
 
     path = Path(filename)
 
-    # При объединении дорожек расширение может измениться на mp4.
+    # После объединения аудио и видео расширение может измениться.
     if not path.is_file():
         merged_path = path.with_suffix(".mp4")
 
@@ -195,16 +199,16 @@ def download_video(url: str, folder: str):
             ]
 
             if not candidates:
-                raise RuntimeError("Загруженный видеофайл не найден")
+                raise RuntimeError("Скачанный файл не найден")
 
             path = candidates[0]
 
     return path, info.get("title", "Видео")
 
 
-# =========================
+# =====================================
 # КОМАНДА /START
-# =========================
+# =====================================
 
 @dp.message(CommandStart())
 async def start_handler(message: Message):
@@ -217,16 +221,16 @@ async def start_handler(message: Message):
 
     await message.answer(
         "🎬 Добро пожаловать в VidMorph!\n\n"
-        "📥 Нажмите «Скачать видео» и отправьте ссылку "
-        "на поддерживаемое видео.\n\n"
-        "Выберите действие в меню.",
+        "📥 Скачать видео — отправьте ссылку.\n"
+        "🎬 Уникализировать видео — функция пока разрабатывается.\n"
+        "⭐ Поддержать бота — платежи пока не подключены.",
         reply_markup=main_keyboard,
     )
 
 
-# =========================
+# =====================================
 # ПРОВЕРКА ПОДПИСКИ ПО КНОПКЕ
-# =========================
+# =====================================
 
 @dp.callback_query(F.data == "check_subscription")
 async def check_subscription_handler(callback):
@@ -239,7 +243,7 @@ async def check_subscription_handler(callback):
 
         if callback.message:
             await callback.message.answer(
-                "✅ Подписка подтверждена! Теперь бот доступен.",
+                "✅ Подписка подтверждена! Бот доступен.",
                 reply_markup=main_keyboard,
             )
     else:
@@ -249,9 +253,9 @@ async def check_subscription_handler(callback):
         )
 
 
-# =========================
+# =====================================
 # КНОПКА СКАЧИВАНИЯ
-# =========================
+# =====================================
 
 @dp.message(F.text == "📥 Скачать видео")
 async def download_button_handler(message: Message):
@@ -267,9 +271,9 @@ async def download_button_handler(message: Message):
     )
 
 
-# =========================
+# =====================================
 # КНОПКА УНИКАЛИЗАЦИИ
-# =========================
+# =====================================
 
 @dp.message(F.text == "🎬 Уникализировать видео")
 async def unique_button_handler(message: Message):
@@ -281,14 +285,14 @@ async def unique_button_handler(message: Message):
         return
 
     await message.answer(
-        "🎬 Функция обработки видео пока не подключена. "
-        "Сейчас можно воспользоваться скачиванием видео."
+        "🎬 Функция уникализации пока не подключена. "
+        "Сейчас доступно скачивание видео по ссылке."
     )
 
 
-# =========================
+# =====================================
 # КНОПКА ПОДДЕРЖКИ
-# =========================
+# =====================================
 
 @dp.message(F.text == "⭐ Поддержать бота")
 async def donate_button_handler(message: Message):
@@ -301,13 +305,13 @@ async def donate_button_handler(message: Message):
 
     await message.answer(
         "⭐ Спасибо за желание поддержать VidMorph!\n"
-        "Платежи через Telegram Stars пока не подключены."
+        "Оплата через Telegram Stars пока не подключена."
     )
 
 
-# =========================
-# ОБРАБОТКА ССЫЛОК
-# =========================
+# =====================================
+# ОБРАБОТКА ССЫЛОК НА ВИДЕО
+# =====================================
 
 @dp.message(F.text)
 async def video_link_handler(message: Message):
@@ -318,8 +322,7 @@ async def video_link_handler(message: Message):
 
     if not url:
         await message.answer(
-            "Отправьте корректную ссылку на видео из YouTube, "
-            "Instagram или TikTok либо выберите действие в меню."
+            "Отправьте ссылку на видео из YouTube, Instagram или TikTok."
         )
         return
 
@@ -328,7 +331,7 @@ async def video_link_handler(message: Message):
         return
 
     status_message = await message.answer(
-        "⏳ Загружаю видео. Это может занять некоторое время..."
+        "⏳ Скачиваю видео. Пожалуйста, подождите..."
     )
 
     try:
@@ -339,45 +342,45 @@ async def video_link_handler(message: Message):
                 temp_folder,
             )
 
-            if not path.exists():
-                raise RuntimeError("Видео не найдено после скачивания")
+            if not path.is_file():
+                raise RuntimeError("Видео после скачивания не найдено")
 
             file_size = path.stat().st_size
 
             if file_size > MAX_TELEGRAM_FILE_SIZE:
                 await status_message.edit_text(
-                    "⚠️ Видео скачано, но его размер превышает "
-                    "лимит отправки, установленный ботом.\n"
-                    "Попробуйте ссылку на видео меньшего размера."
+                    "⚠️ Видео скачано, но файл слишком большой "
+                    "для отправки этим ботом.\n"
+                    "Попробуйте видео меньшего размера."
                 )
                 return
 
+            # ВАЖНО: FSInputFile передаёт локальный файл в aiogram.
+            video_file = FSInputFile(str(path))
+
             await message.answer_video(
-                video=path,
+                video=video_file,
                 caption=f"🎬 {title[:900]}",
                 supports_streaming=True,
             )
 
         await status_message.delete()
 
-    except Exception as error:
-        logger.exception("Ошибка скачивания видео")
+    except Exception:
+        logger.exception("Ошибка скачивания или отправки видео")
 
         try:
             await status_message.edit_text(
-                "❌ Не удалось скачать видео.\n\n"
-                "Возможные причины: видео закрыто, ссылка недоступна, "
-                "платформа временно изменила защиту или произошла ошибка "
-                "загрузки.\n\n"
-                "Попробуйте другую ссылку позже."
+                "❌ Не удалось скачать или отправить видео.\n\n"
+                "Проверьте ссылку или попробуйте другое видео позже."
             )
         except Exception:
             pass
 
 
-# =========================
-# ЗАПУСК БОТА
-# =========================
+# =====================================
+# ЗАПУСК
+# =====================================
 
 async def main():
     logger.info("VidMorph запускается...")
