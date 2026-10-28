@@ -1,8 +1,10 @@
 import asyncio
+import json
 import logging
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import uuid
 from pathlib import Path
@@ -33,6 +35,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
 SUBSCRIBE_URL = os.getenv("SUBSCRIBE_URL", "").strip()
 
+# Лимит отправки файла. Увеличивай только если это позволяет Bot API.
 MAX_FILE_SIZE = 49 * 1024 * 1024
 MAX_CONCURRENT_DOWNLOADS = 2
 
@@ -51,28 +54,22 @@ DONATION_AMOUNTS = {
 
 if not BOT_TOKEN:
     raise RuntimeError("Не задана переменная BOT_TOKEN")
-
 if not CHANNEL_ID:
     raise RuntimeError("Не задана переменная CHANNEL_ID")
-
 if not SUBSCRIBE_URL:
     raise RuntimeError("Не задана переменная SUBSCRIBE_URL")
-
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-
 logger = logging.getLogger(__name__)
 
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
-
 dp = Dispatcher()
-
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
 
@@ -81,8 +78,6 @@ download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 # =====================================
 
 def subscription_keyboard():
-    """Экран до подписки: две кнопки."""
-
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -102,8 +97,6 @@ def subscription_keyboard():
 
 
 def main_menu_keyboard():
-    """Главное меню после подписки: две кнопки."""
-
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -132,16 +125,12 @@ def donation_keyboard():
         ]
         for amount, description in DONATION_AMOUNTS.items()
     ]
-
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text="↩️ В главное меню",
-                callback_data="back_to_menu",
-            )
-        ]
-    )
-
+    rows.append([
+        InlineKeyboardButton(
+            text="↩️ В главное меню",
+            callback_data="back_to_menu",
+        )
+    ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -166,8 +155,7 @@ WELCOME_TEXT = (
     "🎬 <b>VIDMORPH</b>\n"
     "<i>Твои видео. Твоё качество. Без лишних действий.</i>\n\n"
     "Добро пожаловать!\n"
-    "Я помогу скачать видео из "
-    "<b>YouTube, Instagram и TikTok</b> "
+    "Скачивай видео из <b>YouTube, Instagram и TikTok</b> "
     "в лучшем доступном качестве, если ссылка и платформа это позволяют.\n\n"
     "🔒 <b>Чтобы начать пользоваться ботом:</b>\n\n"
     "1. Нажми «Подписаться на канал».\n"
@@ -175,7 +163,6 @@ WELCOME_TEXT = (
     "3. Вернись сюда и нажми «Проверить подписку».\n\n"
     "✨ После проверки откроется главное меню."
 )
-
 
 MAIN_MENU_TEXT = (
     "🎬 <b>VIDMORPH</b>\n"
@@ -185,12 +172,11 @@ MAIN_MENU_TEXT = (
     "🌐 YouTube · Instagram · TikTok"
 )
 
-
 DONATION_TEXT = (
     "💖 <b>Поддержать VidMorph</b>\n\n"
     "Если бот оказался полезен, ты можешь помочь проекту "
     "развиваться и оплачивать его обслуживание.\n\n"
-    "Выбери удобную сумму в Telegram Stars.\n\n"
+    "Выбери удобную сумму в Telegram Stars.\n"
     "Каждая поддержка важна. Спасибо! ✨"
 )
 
@@ -206,12 +192,10 @@ async def is_subscribed(user_id: int) -> bool:
             user_id=user_id,
         )
 
-        status = member.status
-
-        if status in {"creator", "administrator", "member"}:
+        if member.status in {"creator", "administrator", "member"}:
             return True
 
-        if status == "restricted":
+        if member.status == "restricted":
             return bool(getattr(member, "is_member", False))
 
         return False
@@ -244,15 +228,13 @@ async def require_subscription(message: Message) -> bool:
 
 
 # =====================================
-# ОБРАБОТКА ССЫЛОК
+# РАСПОЗНАВАНИЕ ССЫЛОК
 # =====================================
 
 def extract_url(text: str) -> str | None:
     match = re.search(r"https?://[^\s<>]+", text)
-
     if not match:
         return None
-
     return match.group(0).rstrip(".,!?)]}»'\"")
 
 
@@ -264,7 +246,6 @@ def is_supported_url(url: str) -> bool:
             return False
 
         host = (parsed.hostname or "").lower().rstrip(".")
-
         if host.startswith("www."):
             host = host[4:]
 
@@ -282,9 +263,7 @@ def is_supported_url(url: str) -> bool:
 # =====================================
 
 def download_video(url: str, folder: str):
-    output_template = str(
-        Path(folder) / "video.%(ext)s"
-    )
+    output_template = str(Path(folder) / "video.%(ext)s")
 
     options = {
         "format": "bestvideo*+bestaudio/best",
@@ -302,37 +281,27 @@ def download_video(url: str, folder: str):
         info = ydl.extract_info(url, download=True)
 
         if not info:
-            raise RuntimeError(
-                "Не удалось получить информацию о видео"
-            )
+            raise RuntimeError("Не удалось получить информацию о видео")
 
         filename = ydl.prepare_filename(info)
 
     path = Path(filename)
 
-    # После объединения аудио и видео расширение может измениться.
     if not path.is_file():
         mp4_path = path.with_suffix(".mp4")
 
         if mp4_path.is_file():
             path = mp4_path
-
         else:
             candidates = [
-                file
-                for file in Path(folder).glob("video.*")
+                file for file in Path(folder).glob("video.*")
                 if file.is_file()
             ]
 
             if not candidates:
-                raise RuntimeError(
-                    "Скачанный файл не найден"
-                )
+                raise RuntimeError("Скачанный файл не найден")
 
-            path = max(
-                candidates,
-                key=lambda file: file.stat().st_size,
-            )
+            path = max(candidates, key=lambda file: file.stat().st_size)
 
     if path.stat().st_size == 0:
         raise RuntimeError("Скачанный файл пуст")
@@ -341,17 +310,87 @@ def download_video(url: str, folder: str):
 
 
 # =====================================
-# КОМАНДА /START
+# ПОДГОТОВКА ВИДЕО ДЛЯ IPHONE
+# =====================================
+
+def make_iphone_compatible(video_path: Path) -> Path:
+    """Оставляет совместимые файлы без перекодирования."""
+
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "stream=codec_type,codec_name",
+            "-of", "json",
+            str(video_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+
+    streams = json.loads(probe.stdout).get("streams", [])
+
+    video_codecs = [
+        stream["codec_name"]
+        for stream in streams
+        if stream.get("codec_type") == "video"
+    ]
+    audio_codecs = [
+        stream["codec_name"]
+        for stream in streams
+        if stream.get("codec_type") == "audio"
+    ]
+
+    compatible = (
+        video_path.suffix.lower() == ".mp4"
+        and video_codecs
+        and video_codecs[0] == "h264"
+        and (not audio_codecs or audio_codecs[0] == "aac")
+    )
+
+    if compatible:
+        return video_path
+
+    output_path = video_path.with_name("video_iphone.mp4")
+
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i", str(video_path),
+            "-map", "0:v:0",
+            "-map", "0:a:0?",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "20",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
+            str(output_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=1800,
+    )
+
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        raise RuntimeError("Не удалось подготовить видео для iPhone")
+
+    return output_path
+
+
+# =====================================
+# /START
 # =====================================
 
 @dp.message(CommandStart())
 async def start_handler(message: Message):
-    if (
-        message.from_user
-        and await is_subscribed(message.from_user.id)
-    ):
+    if message.from_user and await is_subscribed(message.from_user.id):
         await show_main_menu(message)
-
     else:
         await show_subscription_screen(message)
 
@@ -361,13 +400,9 @@ async def start_handler(message: Message):
 # =====================================
 
 @dp.callback_query(F.data == "check_subscription")
-async def check_subscription_handler(
-    callback: CallbackQuery,
-):
+async def check_subscription_handler(callback: CallbackQuery):
     if await is_subscribed(callback.from_user.id):
-        await callback.answer(
-            "Подписка подтверждена! Доступ открыт 🎉"
-        )
+        await callback.answer("Подписка подтверждена! 🎉")
 
         if callback.message:
             try:
@@ -375,36 +410,29 @@ async def check_subscription_handler(
                     MAIN_MENU_TEXT,
                     reply_markup=main_menu_keyboard(),
                 )
-
             except TelegramAPIError:
                 await callback.message.answer(
                     MAIN_MENU_TEXT,
                     reply_markup=main_menu_keyboard(),
                 )
-
     else:
         await callback.answer(
-            "Подписка пока не найдена. "
-            "Подпишись на канал и проверь ещё раз.",
+            "Подписка пока не найдена. Подпишись и проверь ещё раз.",
             show_alert=True,
         )
 
 
 # =====================================
-# КНОПКА «СКАЧАТЬ ВИДЕО»
+# КНОПКА СКАЧИВАНИЯ
 # =====================================
 
 @dp.callback_query(F.data == "download_prompt")
-async def download_prompt_handler(
-    callback: CallbackQuery,
-):
+async def download_prompt_handler(callback: CallbackQuery):
     await callback.answer()
 
     if not await is_subscribed(callback.from_user.id):
         if callback.message:
-            await show_subscription_screen(
-                callback.message
-            )
+            await show_subscription_screen(callback.message)
         return
 
     if callback.message:
@@ -420,9 +448,7 @@ async def download_prompt_handler(
 # =====================================
 
 @dp.callback_query(F.data == "back_to_menu")
-async def back_to_menu_handler(
-    callback: CallbackQuery,
-):
+async def back_to_menu_handler(callback: CallbackQuery):
     await callback.answer()
 
     if not callback.message:
@@ -434,28 +460,23 @@ async def back_to_menu_handler(
                 MAIN_MENU_TEXT,
                 reply_markup=main_menu_keyboard(),
             )
-
         except TelegramAPIError:
             await callback.message.answer(
                 MAIN_MENU_TEXT,
                 reply_markup=main_menu_keyboard(),
             )
-
     else:
         try:
             await callback.message.edit_text(
                 WELCOME_TEXT,
                 reply_markup=subscription_keyboard(),
             )
-
         except TelegramAPIError:
-            await show_subscription_screen(
-                callback.message
-            )
+            await show_subscription_screen(callback.message)
 
 
 # =====================================
-# МЕНЮ ДОНАТОВ
+# ДОНАТЫ
 # =====================================
 
 @dp.callback_query(F.data == "donate")
@@ -476,26 +497,15 @@ async def donate_handler(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("donate_"))
-async def donate_amount_handler(
-    callback: CallbackQuery,
-):
+async def donate_amount_handler(callback: CallbackQuery):
     try:
-        amount = int(
-            (callback.data or "").split("_", 1)[1]
-        )
-
+        amount = int((callback.data or "").split("_", 1)[1])
     except (ValueError, AttributeError):
-        await callback.answer(
-            "Некорректная сумма.",
-            show_alert=True,
-        )
+        await callback.answer("Некорректная сумма.", show_alert=True)
         return
 
     if amount not in DONATION_AMOUNTS:
-        await callback.answer(
-            "Такой суммы нет.",
-            show_alert=True,
-        )
+        await callback.answer("Такой суммы нет.", show_alert=True)
         return
 
     await callback.answer()
@@ -505,8 +515,8 @@ async def donate_amount_handler(
             chat_id=callback.from_user.id,
             title=f"Поддержка VidMorph: {amount} Stars",
             description=(
-                "Добровольная поддержка проекта "
-                "по разработке и обслуживанию Telegram-бота."
+                "Добровольная поддержка проекта по разработке "
+                "и обслуживанию Telegram-бота."
             ),
             payload=f"donation_{amount}_{uuid.uuid4().hex}",
             provider_token="",
@@ -518,12 +528,8 @@ async def donate_amount_handler(
                 )
             ],
         )
-
     except TelegramAPIError:
-        logger.exception(
-            "Не удалось выставить счёт Stars"
-        )
-
+        logger.exception("Не удалось выставить счёт Stars")
         if callback.message:
             await callback.message.answer(
                 "Не удалось создать платёж. Попробуй позже.",
@@ -532,21 +538,14 @@ async def donate_amount_handler(
 
 
 # =====================================
-# ОПЛАТА TELEGRAM STARS
+# ПЛАТЕЖИ TELEGRAM STARS
 # =====================================
 
 @dp.pre_checkout_query()
-async def pre_checkout_handler(
-    query: PreCheckoutQuery,
-):
+async def pre_checkout_handler(query: PreCheckoutQuery):
     try:
         parts = query.invoice_payload.split("_")
-
-        expected_amount = (
-            int(parts[1])
-            if len(parts) >= 3
-            else -1
-        )
+        expected_amount = int(parts[1]) if len(parts) >= 3 else -1
 
         valid = (
             parts[0] == "donation"
@@ -558,9 +557,7 @@ async def pre_checkout_handler(
         if not valid:
             await query.answer(
                 ok=False,
-                error_message=(
-                    "Не удалось проверить платёж. Попробуй снова."
-                ),
+                error_message="Не удалось проверить платёж. Попробуй снова.",
             )
             return
 
@@ -574,14 +571,11 @@ async def pre_checkout_handler(
 
 
 @dp.message(F.successful_payment)
-async def successful_payment_handler(
-    message: Message,
-):
+async def successful_payment_handler(message: Message):
     payment = message.successful_payment
 
     logger.info(
-        "Успешный Stars-платёж: user_id=%s amount=%s "
-        "currency=%s charge_id=%s",
+        "Успешный Stars-платёж: user_id=%s amount=%s currency=%s charge_id=%s",
         message.from_user.id if message.from_user else None,
         payment.total_amount,
         payment.currency,
@@ -596,24 +590,17 @@ async def successful_payment_handler(
     )
 
 
-# =====================================
-# ПОДДЕРЖКА ПЛАТЕЖЕЙ
-# =====================================
-
 @dp.message(Command("paysupport"))
-async def payment_support_handler(
-    message: Message,
-):
+async def payment_support_handler(message: Message):
     await message.answer(
-        "Если возник вопрос по донату или платёж прошёл "
-        "некорректно, напиши администратору проекта.\n\n"
-        "Укажи дату платежа и сумму. "
-        "Не отправляй пароли или коды."
+        "Если возник вопрос по донату или платёж прошёл некорректно, "
+        "напиши администратору проекта.\n\n"
+        "Укажи дату платежа и сумму. Не отправляй пароли или коды."
     )
 
 
 # =====================================
-# ОБРАБОТКА СООБЩЕНИЙ И ССЫЛОК
+# ОБРАБОТКА ССЫЛОК
 # =====================================
 
 @dp.message(F.text)
@@ -625,19 +612,13 @@ async def video_handler(message: Message):
         if text.startswith("/"):
             return
 
-        if (
-            not message.from_user
-            or not await is_subscribed(message.from_user.id)
-        ):
+        if not message.from_user or not await is_subscribed(message.from_user.id):
             await show_subscription_screen(message)
-
         else:
             await message.answer(
-                "👋 Выбери действие в меню ниже "
-                "или отправь ссылку на видео.",
+                "👋 Выбери действие в меню или отправь ссылку на видео.",
                 reply_markup=main_menu_keyboard(),
             )
-
         return
 
     if not is_supported_url(url):
@@ -655,9 +636,7 @@ async def video_handler(message: Message):
     )
 
     async with download_semaphore:
-        temp_dir = Path(
-            tempfile.mkdtemp(prefix="vidmorph_")
-        )
+        temp_dir = Path(tempfile.mkdtemp(prefix="vidmorph_"))
 
         try:
             video_path, title = await asyncio.to_thread(
@@ -666,48 +645,51 @@ async def video_handler(message: Message):
                 str(temp_dir),
             )
 
+            await status_message.edit_text(
+                "🎬 Проверяю совместимость с iPhone…"
+            )
+
+            video_path = await asyncio.to_thread(
+                make_iphone_compatible,
+                video_path,
+            )
+
             if video_path.stat().st_size > MAX_FILE_SIZE:
                 await status_message.edit_text(
-                    "📦 <b>Файл слишком большой для отправки.</b>\n\n"
+                    "📦 <b>Видео слишком большое для отправки.</b>\n\n"
                     "Попробуй видео меньшего размера."
                 )
                 return
 
             await status_message.edit_text(
-                "✨ Видео готово. Отправляю файл…"
+                "✨ Видео готово! Отправляю в видеоплеер Telegram…"
             )
 
-            await message.answer_document(
-                document=FSInputFile(
+            await message.answer_video(
+                video=FSInputFile(
                     path=str(video_path),
-                    filename=video_path.name,
+                    filename="VidMorph_video.mp4",
                 ),
                 caption=f"🎬 {title[:900]}",
+                supports_streaming=True,
             )
 
             await status_message.delete()
 
         except Exception:
-            logger.exception(
-                "Ошибка скачивания или отправки"
-            )
+            logger.exception("Ошибка скачивания, конвертации или отправки")
 
             try:
                 await status_message.edit_text(
-                    "😕 <b>Не получилось получить это видео.</b>\n\n"
-                    "Возможно, ссылка недоступна, видео закрыто "
-                    "или платформа временно ограничила скачивание. "
-                    "Попробуй другую ссылку позже."
+                    "😕 <b>Не получилось подготовить или отправить видео.</b>\n\n"
+                    "Возможно, ссылка недоступна, платформа ограничила "
+                    "скачивание или файл слишком большой. Попробуй позже."
                 )
-
             except TelegramAPIError:
                 pass
 
         finally:
-            shutil.rmtree(
-                temp_dir,
-                ignore_errors=True,
-            )
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 # =====================================
@@ -719,7 +701,6 @@ async def main():
 
     try:
         await dp.start_polling(bot)
-
     finally:
         await bot.session.close()
 
