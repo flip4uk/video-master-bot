@@ -1,41 +1,54 @@
 import asyncio
 import logging
 import os
+import re
+import shutil
 import tempfile
+import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
 import yt_dlp
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
+    CallbackQuery,
+    PreCheckoutQuery,
+    LabeledPrice,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     FSInputFile,
 )
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramAPIError
 
 
 # =====================================
-# НАСТРОЙКИ
+# SETTINGS
 # =====================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")
-SUBSCRIBE_URL = os.getenv("SUBSCRIBE_URL")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
+SUBSCRIBE_URL = os.getenv("SUBSCRIBE_URL", "").strip()
 
-# Ограничиваем размер отправляемого видео примерно 49 МБ.
-MAX_TELEGRAM_FILE_SIZE = 49 * 1024 * 1024
+# Telegram cloud Bot API upload limit may restrict large files.
+# This conservative limit can be adjusted to your actual environment.
+MAX_FILE_SIZE = 49 * 1024 * 1024
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+MAX_CONCURRENT_DOWNLOADS = 2
 
-logger = logging.getLogger(__name__)
+SUPPORTED_DOMAINS = {
+    "youtube.com",
+    "youtu.be",
+    "instagram.com",
+    "tiktok.com",
+}
+
+DONATION_AMOUNTS = {
+    25: "Небольшая поддержка",
+    50: "Спасибо за проект",
+    100: "Большая поддержка",
+}
 
 if not BOT_TOKEN:
     raise RuntimeError("Не задана переменная BOT_TOKEN")
@@ -46,53 +59,62 @@ if not CHANNEL_ID:
 if not SUBSCRIBE_URL:
     raise RuntimeError("Не задана переменная SUBSCRIBE_URL")
 
-try:
-    CHANNEL_ID = int(CHANNEL_ID)
-except ValueError:
-    pass
-
-
-# =====================================
-# СОЗДАНИЕ БОТА
-# =====================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
 
 # =====================================
-# КЛАВИАТУРЫ
+# KEYBOARDS
 # =====================================
 
-main_keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="📥 Скачать видео")],
-        [KeyboardButton(text="🎬 Уникализировать видео")],
-        [KeyboardButton(text="⭐ Поддержать бота")],
-    ],
-    resize_keyboard=True,
-)
+def main_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📢 Подписаться на канал",
+                    url=SUBSCRIBE_URL,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✅ Проверить подписку",
+                    callback_data="check_subscription",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💝 Поддержать проект",
+                    callback_data="donate",
+                )
+            ],
+        ]
+    )
 
-subscribe_keyboard = InlineKeyboardMarkup(
-    inline_keyboard=[
-        [
-            InlineKeyboardButton(
-                text="📢 Подписаться на канал",
-                url=SUBSCRIBE_URL,
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="✅ Проверить подписку",
-                callback_data="check_subscription",
-            )
-        ],
-    ]
-)
+
+def donation_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"⭐ {amount} Stars",
+                    callback_data=f"donate_{amount}",
+                )
+            ]
+            for amount in DONATION_AMOUNTS
+        ]
+    )
 
 
 # =====================================
-# ПРОВЕРКА ПОДПИСКИ
+# SUBSCRIPTION
 # =====================================
 
 async def is_subscribed(user_id: int) -> bool:
@@ -102,69 +124,83 @@ async def is_subscribed(user_id: int) -> bool:
             user_id=user_id,
         )
 
-        return member.status in (
-            "member",
-            "administrator",
-            "creator",
-        )
+        status = member.status
 
-    except (TelegramBadRequest, TelegramForbiddenError) as error:
-        logger.error("Ошибка проверки подписки: %s", error)
+        if status in {"creator", "administrator", "member"}:
+            return True
+
+        # Restricted users may still be channel members.
+        if status == "restricted":
+            return bool(getattr(member, "is_member", False))
+
         return False
 
-    except Exception:
+    except TelegramAPIError:
         logger.exception("Не удалось проверить подписку")
         return False
 
 
-async def ask_to_subscribe(message: Message):
+async def require_subscription(message: Message) -> bool:
+    if not message.from_user:
+        return False
+
+    if await is_subscribed(message.from_user.id):
+        return True
+
     await message.answer(
-        "👋 Чтобы пользоваться VidMorph, подпишитесь на канал, "
-        "затем нажмите «Проверить подписку».",
-        reply_markup=subscribe_keyboard,
+        "🔒 Для скачивания видео необходимо подписаться на канал.\n\n"
+        "1. Нажми «Подписаться на канал».\n"
+        "2. Подпишись.\n"
+        "3. Нажми «Проверить подписку».\n\n"
+        "Поддержать проект можно и без подписки.",
+        reply_markup=main_keyboard(),
     )
+    return False
 
 
 # =====================================
-# ПРОВЕРКА ССЫЛКИ
+# URL VALIDATION
 # =====================================
 
-def get_video_url(text: str):
-    text = text.strip()
+def extract_url(text: str) -> str | None:
+    match = re.search(r"https?://[^\s<>]+", text)
 
+    if not match:
+        return None
+
+    return match.group(0).rstrip(".,!?)]}»'\"")
+
+
+def is_supported_url(url: str) -> bool:
     try:
-        parsed = urlparse(text)
-    except Exception:
-        return None
+        parsed = urlparse(url.strip())
 
-    if parsed.scheme not in ("http", "https"):
-        return None
+        if parsed.scheme not in {"http", "https"}:
+            return False
 
-    host = (parsed.hostname or "").lower()
+        host = (parsed.hostname or "").lower().rstrip(".")
 
-    allowed_domains = (
-        "youtube.com",
-        "youtu.be",
-        "youtube-nocookie.com",
-        "instagram.com",
-        "tiktok.com",
-    )
+        if host.startswith("www."):
+            host = host[4:]
 
-    for domain in allowed_domains:
-        if host == domain or host.endswith("." + domain):
-            return text
+        return any(
+            host == domain or host.endswith("." + domain)
+            for domain in SUPPORTED_DOMAINS
+        )
 
-    return None
+    except ValueError:
+        return False
 
 
 # =====================================
-# СКАЧИВАНИЕ ВИДЕО
+# VIDEO DOWNLOAD
 # =====================================
 
 def download_video(url: str, folder: str):
     output_template = str(Path(folder) / "video.%(ext)s")
 
     options = {
+        "format": "bestvideo*+bestaudio/best",
         "outtmpl": output_template,
         "noplaylist": True,
         "quiet": True,
@@ -185,210 +221,280 @@ def download_video(url: str, folder: str):
 
     path = Path(filename)
 
-    # После объединения аудио и видео расширение может измениться.
+    # The final extension may change after merging streams.
     if not path.is_file():
-        merged_path = path.with_suffix(".mp4")
+        mp4_path = path.with_suffix(".mp4")
 
-        if merged_path.is_file():
-            path = merged_path
+        if mp4_path.is_file():
+            path = mp4_path
         else:
             candidates = [
-                file
-                for file in Path(folder).glob("video.*")
+                file for file in Path(folder).glob("video.*")
                 if file.is_file()
             ]
 
             if not candidates:
                 raise RuntimeError("Скачанный файл не найден")
 
-            path = candidates[0]
+            path = max(candidates, key=lambda file: file.stat().st_size)
+
+    if path.stat().st_size == 0:
+        raise RuntimeError("Скачанный файл пуст")
 
     return path, info.get("title", "Видео")
 
 
 # =====================================
-# КОМАНДА /START
+# START
 # =====================================
 
 @dp.message(CommandStart())
 async def start_handler(message: Message):
-    if not message.from_user:
-        return
-
-    if not await is_subscribed(message.from_user.id):
-        await ask_to_subscribe(message)
-        return
-
     await message.answer(
-        "🎬 Добро пожаловать в VidMorph!\n\n"
-        "📥 Скачать видео — отправьте ссылку.\n"
-        "🎬 Уникализировать видео — функция пока разрабатывается.\n"
-        "⭐ Поддержать бота — платежи пока не подключены.",
-        reply_markup=main_keyboard,
+        "👋 Привет! Это бот для скачивания видео.\n\n"
+        "Поддерживаются ссылки на YouTube, Instagram и TikTok.\n"
+        "Для скачивания требуется подписка на канал.\n\n"
+        "💝 Если хочешь поддержать развитие проекта, "
+        "нажми кнопку доната.",
+        reply_markup=main_keyboard(),
     )
 
 
 # =====================================
-# ПРОВЕРКА ПОДПИСКИ ПО КНОПКЕ
+# SUBSCRIPTION BUTTON
 # =====================================
 
 @dp.callback_query(F.data == "check_subscription")
-async def check_subscription_handler(callback):
-    if not callback.from_user:
-        await callback.answer()
-        return
-
+async def check_subscription_handler(callback: CallbackQuery):
     if await is_subscribed(callback.from_user.id):
         await callback.answer("Подписка подтверждена!")
-
         if callback.message:
             await callback.message.answer(
-                "✅ Подписка подтверждена! Бот доступен.",
-                reply_markup=main_keyboard,
+                "✅ Подписка подтверждена!\n"
+                "Теперь отправь ссылку на видео."
             )
     else:
         await callback.answer(
-            "Подписка не найдена. Подпишитесь и попробуйте ещё раз.",
+            "Подписка не найдена. Подпишись и попробуй снова.",
             show_alert=True,
         )
 
 
 # =====================================
-# КНОПКА СКАЧИВАНИЯ
+# DONATION MENU
 # =====================================
 
-@dp.message(F.text == "📥 Скачать видео")
-async def download_button_handler(message: Message):
-    if not message.from_user:
+@dp.callback_query(F.data == "donate")
+async def donate_handler(callback: CallbackQuery):
+    await callback.answer()
+
+    if callback.message:
+        await callback.message.answer(
+            "💝 Спасибо, что хочешь поддержать проект!\n\n"
+            "Выбери сумму добровольного доната в Telegram Stars:",
+            reply_markup=donation_keyboard(),
+        )
+
+
+@dp.callback_query(F.data.startswith("donate_"))
+async def donate_amount_handler(callback: CallbackQuery):
+    try:
+        amount = int(callback.data.split("_", 1)[1])
+    except (ValueError, AttributeError):
+        await callback.answer("Некорректная сумма.", show_alert=True)
         return
 
-    if not await is_subscribed(message.from_user.id):
-        await ask_to_subscribe(message)
+    if amount not in DONATION_AMOUNTS:
+        await callback.answer("Такой суммы нет.", show_alert=True)
         return
+
+    await callback.answer()
+
+    try:
+        await bot.send_invoice(
+            chat_id=callback.from_user.id,
+            title=f"Донат: {DONATION_AMOUNTS[amount]}",
+            description=(
+                "Добровольная поддержка проекта "
+                "по разработке и обслуживанию Telegram-бота."
+            ),
+            payload=f"donation_{amount}_{uuid.uuid4().hex}",
+            provider_token="",
+            currency="XTR",
+            prices=[
+                LabeledPrice(
+                    label="Добровольный донат",
+                    amount=amount,
+                )
+            ],
+        )
+    except TelegramAPIError:
+        logger.exception("Не удалось выставить счёт Stars")
+        if callback.message:
+            await callback.message.answer(
+                "Не удалось создать платёж. Попробуй позже."
+            )
+
+
+# =====================================
+# TELEGRAM STARS PAYMENT
+# =====================================
+
+@dp.pre_checkout_query()
+async def pre_checkout_handler(query: PreCheckoutQuery):
+    # Confirm the requested amount and currency before accepting payment.
+    try:
+        parts = query.invoice_payload.split("_")
+        expected_amount = int(parts[1]) if len(parts) >= 3 else -1
+
+        valid = (
+            parts[0] == "donation"
+            and expected_amount in DONATION_AMOUNTS
+            and query.currency == "XTR"
+            and query.total_amount == expected_amount
+        )
+
+        if not valid:
+            await query.answer(
+                ok=False,
+                error_message="Не удалось проверить платёж. Попробуй снова.",
+            )
+            return
+
+        await query.answer(ok=True)
+
+    except (ValueError, IndexError):
+        await query.answer(
+            ok=False,
+            error_message="Некорректные данные платежа.",
+        )
+
+
+@dp.message(F.successful_payment)
+async def successful_payment_handler(message: Message):
+    payment = message.successful_payment
+
+    logger.info(
+        "Успешный Stars-платёж: user_id=%s amount=%s currency=%s charge_id=%s",
+        message.from_user.id if message.from_user else None,
+        payment.total_amount,
+        payment.currency,
+        payment.telegram_payment_charge_id,
+    )
 
     await message.answer(
-        "📎 Отправьте ссылку на видео из YouTube, Instagram или TikTok."
+        "💝 Спасибо за поддержку проекта!\n\n"
+        f"Получено: ⭐ {payment.total_amount} Stars.\n"
+        "Твой вклад помогает поддерживать работу бота."
     )
 
 
 # =====================================
-# КНОПКА УНИКАЛИЗАЦИИ
+# PAYMENT SUPPORT
 # =====================================
 
-@dp.message(F.text == "🎬 Уникализировать видео")
-async def unique_button_handler(message: Message):
-    if not message.from_user:
-        return
-
-    if not await is_subscribed(message.from_user.id):
-        await ask_to_subscribe(message)
-        return
-
+@dp.message(Command("paysupport"))
+async def payment_support_handler(message: Message):
     await message.answer(
-        "🎬 Функция уникализации пока не подключена. "
-        "Сейчас доступно скачивание видео по ссылке."
+        "Если у тебя возник вопрос по донату или платёж прошёл некорректно, "
+        "напиши администратору проекта.\n\n"
+        "Укажи дату платежа и сумму. Не отправляй пароли или коды."
     )
 
 
 # =====================================
-# КНОПКА ПОДДЕРЖКИ
-# =====================================
-
-@dp.message(F.text == "⭐ Поддержать бота")
-async def donate_button_handler(message: Message):
-    if not message.from_user:
-        return
-
-    if not await is_subscribed(message.from_user.id):
-        await ask_to_subscribe(message)
-        return
-
-    await message.answer(
-        "⭐ Спасибо за желание поддержать VidMorph!\n"
-        "Оплата через Telegram Stars пока не подключена."
-    )
-
-
-# =====================================
-# ОБРАБОТКА ССЫЛОК НА ВИДЕО
+# VIDEO HANDLER
 # =====================================
 
 @dp.message(F.text)
-async def video_link_handler(message: Message):
-    if not message.from_user or not message.text:
-        return
-
-    url = get_video_url(message.text)
+async def video_handler(message: Message):
+    text = message.text or ""
+    url = extract_url(text)
 
     if not url:
         await message.answer(
-            "Отправьте ссылку на видео из YouTube, Instagram или TikTok."
+            "Отправь ссылку на видео из YouTube, Instagram или TikTok.",
+            reply_markup=main_keyboard(),
         )
         return
 
-    if not await is_subscribed(message.from_user.id):
-        await ask_to_subscribe(message)
+    if not is_supported_url(url):
+        await message.answer(
+            "❌ Поддерживаются ссылки только на YouTube, Instagram и TikTok."
+        )
+        return
+
+    if not await require_subscription(message):
         return
 
     status_message = await message.answer(
-        "⏳ Скачиваю видео. Пожалуйста, подождите..."
+        "⏳ Скачиваю видео в лучшем доступном качестве..."
     )
 
-    try:
-        with tempfile.TemporaryDirectory() as temp_folder:
-            path, title = await asyncio.to_thread(
+    async with download_semaphore:
+        temp_dir = Path(tempfile.mkdtemp(prefix="video_bot_"))
+
+        try:
+            video_path, title = await asyncio.to_thread(
                 download_video,
                 url,
-                temp_folder,
+                str(temp_dir),
             )
 
-            if not path.is_file():
-                raise RuntimeError("Видео после скачивания не найдено")
+            file_size = video_path.stat().st_size
 
-            file_size = path.stat().st_size
-
-            if file_size > MAX_TELEGRAM_FILE_SIZE:
+            if file_size > MAX_FILE_SIZE:
                 await status_message.edit_text(
-                    "⚠️ Видео скачано, но файл слишком большой "
-                    "для отправки этим ботом.\n"
-                    "Попробуйте видео меньшего размера."
+                    "❌ Файл получился слишком большим для отправки "
+                    "в текущей конфигурации бота.\n\n"
+                    "Попробуй видео меньшего размера."
                 )
                 return
 
-            # ВАЖНО: FSInputFile передаёт локальный файл в aiogram.
-            video_file = FSInputFile(str(path))
-
-            await message.answer_video(
-                video=video_file,
-                caption=f"🎬 {title[:900]}",
-                supports_streaming=True,
-            )
-
-        await status_message.delete()
-
-    except Exception:
-        logger.exception("Ошибка скачивания или отправки видео")
-
-        try:
             await status_message.edit_text(
-                "❌ Не удалось скачать или отправить видео.\n\n"
-                "Проверьте ссылку или попробуйте другое видео позже."
+                "📤 Видео скачано. Отправляю файл..."
             )
+
+            # Send as a document to avoid Telegram video processing.
+            await message.answer_document(
+                document=FSInputFile(
+                    path=str(video_path),
+                    filename=video_path.name,
+                ),
+                caption=f"🎬 {title[:900]}",
+            )
+
+            await status_message.delete()
+
         except Exception:
-            pass
+            logger.exception("Ошибка скачивания или отправки")
+
+            try:
+                await status_message.edit_text(
+                    "❌ Не получилось скачать или отправить видео.\n\n"
+                    "Возможно, ссылка недоступна, видео закрыто, "
+                    "платформа временно ограничила скачивание "
+                    "или файл слишком большой. Попробуй позже."
+                )
+            except TelegramAPIError:
+                pass
+
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 # =====================================
-# ЗАПУСК
+# RUN BOT
 # =====================================
 
 async def main():
-    logger.info("VidMorph запускается...")
-    await dp.start_polling(bot)
+    logger.info("Бот запускается")
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    finally:
-        logger.info("Работа VidMorph завершена")
+    asyncio.run(main())
