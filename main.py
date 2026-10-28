@@ -6,41 +6,38 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
 import yt_dlp
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart, Command
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    LabeledPrice,
-    PreCheckoutQuery,
-    FSInputFile,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
 from aiogram.exceptions import TelegramAPIError
-
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LabeledPrice,
+    Message,
+    PreCheckoutQuery,
+)
 
 # ============================================================
-# НАСТРОЙКИ
+# SETTINGS
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
 SUBSCRIBE_URL = os.getenv("SUBSCRIBE_URL", "").strip()
-
 DONATE_STARS = int(os.getenv("DONATE_STARS", "50"))
 
-# Telegram Bot API обычно принимает видео размером до 50 MB.
-# Оставляем запас, чтобы не упереться в ограничение.
-MAX_FILE_SIZE = 49 * 1024 * 1024
-
+MAX_FILE_SIZE = 47 * 1024 * 1024
 MAX_CONCURRENT_DOWNLOADS = 1
-DOWNLOAD_TIMEOUT = 600
-CONVERT_TIMEOUT = 900
+TEMP_PREFIX = "vidmorph_"
+TEMP_MAX_AGE_HOURS = 6
+FFMPEG_TIMEOUT = 600
 
 SUPPORTED_DOMAINS = (
     "youtube.com",
@@ -50,17 +47,16 @@ SUPPORTED_DOMAINS = (
 )
 
 if not BOT_TOKEN:
-    raise RuntimeError("Не задан BOT_TOKEN")
-
+    raise RuntimeError("Не задана переменная BOT_TOKEN")
 if not CHANNEL_ID:
-    raise RuntimeError("Не задан CHANNEL_ID")
-
+    raise RuntimeError("Не задана переменная CHANNEL_ID")
 if not SUBSCRIBE_URL:
-    raise RuntimeError("Не задан SUBSCRIBE_URL")
-
+    raise RuntimeError("Не задана переменная SUBSCRIBE_URL")
+if DONATE_STARS < 1:
+    raise RuntimeError("DONATE_STARS должна быть больше нуля")
 
 # ============================================================
-# ЛОГИ И ЗАПУСК
+# LOGGING AND BOT
 # ============================================================
 
 logging.basicConfig(
@@ -72,12 +68,29 @@ logger = logging.getLogger("VidMorph")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
 
 # ============================================================
-# КНОПКИ
+# TEMPORARY FILE CLEANUP
+# ============================================================
+
+def cleanup_old_temp_dirs():
+    """Remove stale temporary folders left after a crash or forced restart."""
+    temp_root = Path(tempfile.gettempdir())
+    cutoff = time.time() - TEMP_MAX_AGE_HOURS * 3600
+
+    for folder in temp_root.glob(f"{TEMP_PREFIX}*"):
+        try:
+            if folder.is_dir() and folder.stat().st_mtime < cutoff:
+                shutil.rmtree(folder, ignore_errors=True)
+                logger.info("Удалена старая временная папка: %s", folder.name)
+        except OSError:
+            logger.warning("Не удалось очистить папку: %s", folder.name)
+
+
+# ============================================================
+# KEYBOARDS
 # ============================================================
 
 def subscription_keyboard():
@@ -113,7 +126,7 @@ def main_keyboard():
 
 
 # ============================================================
-# ПРОВЕРКА ПОДПИСКИ
+# SUBSCRIPTION CHECK
 # ============================================================
 
 async def is_subscribed(user_id: int) -> bool:
@@ -122,11 +135,13 @@ async def is_subscribed(user_id: int) -> bool:
             chat_id=CHANNEL_ID,
             user_id=user_id,
         )
-
         return member.status in ("creator", "administrator", "member")
 
-    except TelegramAPIError as exc:
-        logger.error("Ошибка проверки подписки: %s", exc)
+    except TelegramAPIError:
+        logger.exception(
+            "Не удалось проверить подписку. "
+            "Проверь CHANNEL_ID и доступ бота к каналу."
+        )
         return False
 
 
@@ -145,15 +160,11 @@ async def require_subscription(message: Message) -> bool:
 
 
 # ============================================================
-# ПРОВЕРКА ССЫЛКИ
+# URL VALIDATION
 # ============================================================
 
 def extract_video_url(text: str) -> str | None:
-    if not text:
-        return None
-
-    match = re.search(r"https?://[^\s<>]+", text)
-
+    match = re.search(r"https?://[^\s<>]+", text or "")
     if not match:
         return None
 
@@ -179,8 +190,13 @@ def extract_video_url(text: str) -> str | None:
 
 
 # ============================================================
-# СКАЧИВАНИЕ ВИДЕО
+# DOWNLOAD VIDEO
 # ============================================================
+
+VIDEO_EXTENSIONS = {
+    ".mp4", ".mkv", ".webm", ".mov", ".m4v", ".flv", ".avi"
+}
+
 
 def download_video(url: str, folder: Path) -> Path:
     output_template = str(folder / "video.%(ext)s")
@@ -196,20 +212,19 @@ def download_video(url: str, folder: Path) -> Path:
         "noplaylist": True,
         "quiet": True,
         "no_warnings": False,
-        "retries": 3,
-        "fragment_retries": 3,
+        "retries": 2,
+        "fragment_retries": 2,
         "socket_timeout": 30,
-        "restrictfilenames": True,
         "overwrites": True,
     }
 
-    # Deno помогает yt-dlp получать некоторые форматы YouTube.
-    # Если Deno не установлен, yt-dlp попробует работать без него.
     deno_path = shutil.which("deno")
     if deno_path:
-        options["js_runtimes"] = {"deno": {"path": deno_path}}
+        options["js_runtimes"] = {
+            "deno": {"path": deno_path}
+        }
 
-    logger.info("Начинаю скачивание: %s", url)
+    logger.info("Начинаю скачивание видео")
 
     with yt_dlp.YoutubeDL(options) as ydl:
         ydl.download([url])
@@ -218,24 +233,26 @@ def download_video(url: str, folder: Path) -> Path:
         path
         for path in folder.iterdir()
         if path.is_file()
-        and path.name.startswith("video.")
-        and path.suffix.lower() not in (".part", ".ytdl", ".json")
+        and path.suffix.lower() in VIDEO_EXTENSIONS
+        and not path.name.endswith((".part", ".ytdl"))
     ]
 
     if not candidates:
-        raise RuntimeError(
-            "Скачивание завершилось, но видеофайл не найден."
-        )
+        raise RuntimeError("Не удалось найти скачанный видеофайл.")
 
-    # При наличии нескольких файлов выбираем самый большой.
-    video_path = max(candidates, key=lambda p: p.stat().st_size)
+    video_path = max(candidates, key=lambda path: path.stat().st_size)
 
     if video_path.stat().st_size == 0:
         raise RuntimeError("Скачанный файл пустой.")
 
+    if video_path.stat().st_size > MAX_FILE_SIZE:
+        raise RuntimeError(
+            "Видео превышает лимит отправки бота (примерно 47 MiB). "
+            "Попробуй видео меньшего размера."
+        )
+
     logger.info(
-        "Видео скачано: %s, %.2f MB",
-        video_path.name,
+        "Видео скачано: %.2f MiB",
         video_path.stat().st_size / (1024 * 1024),
     )
 
@@ -243,7 +260,7 @@ def download_video(url: str, folder: Path) -> Path:
 
 
 # ============================================================
-# ПОДГОТОВКА ВИДЕО ДЛЯ TELEGRAM
+# VIDEO INSPECTION
 # ============================================================
 
 def probe_video(video_path: Path) -> dict:
@@ -259,17 +276,21 @@ def probe_video(video_path: Path) -> dict:
         capture_output=True,
         text=True,
         check=True,
-        timeout=60,
+        timeout=45,
     )
 
     return json.loads(result.stdout)
 
 
+# ============================================================
+# PREPARE VIDEO FOR TELEGRAM
+# ============================================================
+
 def make_telegram_compatible(video_path: Path) -> Path:
     """
-    Если видео уже H.264/AAC в MP4 — не перекодируем.
-    Если можно обойтись без потери качества — перепаковываем.
-    Перекодирование используем только при необходимости.
+    H.264/AAC MP4 is sent without conversion.
+    H.264/AAC in another container is remuxed without quality loss.
+    Other codecs are converted only when necessary.
     """
 
     info = probe_video(video_path)
@@ -288,30 +309,29 @@ def make_telegram_compatible(video_path: Path) -> Path:
         raise RuntimeError("В файле не обнаружена видеодорожка.")
 
     video_codec = videos[0].get("codec_name")
-    audio_codecs = [stream.get("codec_name") for stream in audios]
+    audio_codecs = [
+        stream.get("codec_name") for stream in audios
+    ]
 
-    compatible = (
+    audio_ok = all(codec == "aac" for codec in audio_codecs)
+
+    # Most efficient path: send the original file as-is.
+    if (
         video_path.suffix.lower() == ".mp4"
         and video_codec == "h264"
-        and all(codec == "aac" for codec in audio_codecs)
-    )
-
-    if compatible:
-        logger.info("Видео уже совместимо с Telegram — пропускаю FFmpeg.")
+        and audio_ok
+    ):
+        logger.info("Подготовка не требуется.")
         return video_path
 
     output_path = video_path.with_name("video_telegram.mp4")
 
-    # Если кодеки подходят, просто перепаковываем контейнер.
-    # Качество при этом не теряется.
-    can_remux = (
-        video_codec == "h264"
-        and all(codec == "aac" for codec in audio_codecs)
-    )
-
-    if can_remux:
+    # Remux compatible codecs without re-encoding.
+    if video_codec == "h264" and audio_ok:
         command = [
             "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
             "-y",
             "-i", str(video_path),
             "-map", "0:v:0",
@@ -321,16 +341,19 @@ def make_telegram_compatible(video_path: Path) -> Path:
             str(output_path),
         ]
     else:
-        # Более лёгкое перекодирование для ограниченной памяти.
-        # Оно может немного снизить качество исходника.
+        # Lightweight conversion if the original codecs are unsuitable.
+        # This can reduce the original quality.
         command = [
             "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
             "-y",
             "-i", str(video_path),
             "-map", "0:v:0",
             "-map", "0:a:0?",
             "-vf",
-            "scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2",
+            "scale=w='min(1280,iw)':h='min(720,ih)':"
+            "force_original_aspect_ratio=decrease:force_divisible_by=2",
             "-c:v", "libx264",
             "-preset", "ultrafast",
             "-crf", "28",
@@ -344,47 +367,50 @@ def make_telegram_compatible(video_path: Path) -> Path:
             str(output_path),
         ]
 
-    logger.info(
-        "Подготавливаю видео. Исходный кодек: %s; перепаковка: %s",
-        video_codec,
-        can_remux,
-    )
+    logger.info("Выполняется обработка видео.")
 
     try:
         result = subprocess.run(
             command,
             capture_output=True,
             text=True,
-            timeout=CONVERT_TIMEOUT,
+            timeout=FFMPEG_TIMEOUT,
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(
-            "Подготовка видео заняла слишком много времени."
+            "Обработка видео заняла слишком много времени."
         ) from exc
 
     if result.returncode != 0:
-        error_text = (result.stderr or "")[-2500:]
-        logger.error("Ошибка FFmpeg: %s", error_text)
-
-        # Не отправляем неподготовленный файл как заведомо совместимый.
-        raise RuntimeError(
-            "Не удалось подготовить видео для просмотра в Telegram. "
-            "Возможно, на хостинге не хватает памяти."
+        logger.error(
+            "FFmpeg завершился с кодом %s: %s",
+            result.returncode,
+            (result.stderr or "")[-2000:],
         )
 
-    if not output_path.is_file() or output_path.stat().st_size == 0:
-        raise RuntimeError("FFmpeg не создал итоговый файл.")
+        if result.returncode == -9:
+            raise RuntimeError(
+                "Сервер остановил обработку видео. "
+                "Возможно, не хватает оперативной памяти. "
+                "Попробуй ролик меньшего размера."
+            )
 
-    logger.info(
-        "Подготовка завершена: %.2f MB",
-        output_path.stat().st_size / (1024 * 1024),
-    )
+        raise RuntimeError("Не удалось подготовить видео к отправке.")
+
+    if not output_path.is_file() or output_path.stat().st_size == 0:
+        raise RuntimeError("Итоговый видеофайл не создан.")
+
+    if output_path.stat().st_size > MAX_FILE_SIZE:
+        raise RuntimeError(
+            "Подготовленное видео превышает лимит отправки. "
+            "Попробуй ролик меньшего размера."
+        )
 
     return output_path
 
 
 # ============================================================
-# /START
+# START COMMAND
 # ============================================================
 
 @dp.message(CommandStart())
@@ -394,28 +420,21 @@ async def start_handler(message: Message):
 
     await message.answer(
         "👋 Привет! Это VidMorph.\n\n"
-        "Отправь ссылку на видео из YouTube, Instagram или TikTok.\n"
-        "Я попробую скачать его и отправить сюда как видео, "
-        "чтобы его можно было смотреть прямо в Telegram.\n\n"
-        "Важно: доступность скачивания зависит от источника, "
-        "ограничений платформы и размера видео.",
+        "Отправь ссылку на видео из YouTube, Instagram или TikTok. "
+        "Я попробую скачать ролик и отправить его прямо сюда.\n\n"
+        "Доступность скачивания зависит от ограничений источника.",
         reply_markup=main_keyboard(),
     )
 
 
 # ============================================================
-# ПРОВЕРКА ПОДПИСКИ ПО КНОПКЕ
+# SUBSCRIPTION BUTTON
 # ============================================================
 
 @dp.callback_query(F.data == "check_subscription")
 async def check_subscription_handler(callback: CallbackQuery):
-    if not callback.from_user:
-        await callback.answer()
-        return
-
     if await is_subscribed(callback.from_user.id):
         await callback.answer("Подписка подтверждена!")
-
         if callback.message:
             await callback.message.answer(
                 "✅ Подписка подтверждена! Теперь отправь ссылку на видео."
@@ -428,15 +447,11 @@ async def check_subscription_handler(callback: CallbackQuery):
 
 
 # ============================================================
-# ДОНАТЫ TELEGRAM STARS
+# TELEGRAM STARS DONATIONS
 # ============================================================
 
 @dp.callback_query(F.data == "donate")
 async def donate_handler(callback: CallbackQuery):
-    if not callback.from_user:
-        await callback.answer()
-        return
-
     if not await is_subscribed(callback.from_user.id):
         await callback.answer(
             "Сначала подпишись на канал.",
@@ -466,26 +481,6 @@ async def donate_handler(callback: CallbackQuery):
     )
 
 
-@dp.pre_checkout_query()
-async def pre_checkout_handler(query: PreCheckoutQuery):
-    await query.answer(ok=True)
-
-
-@dp.message(F.successful_payment)
-async def successful_payment_handler(message: Message):
-    payment = message.successful_payment
-
-    if payment and payment.currency == "XTR":
-        await message.answer(
-            "⭐ Спасибо за поддержку VidMorph! "
-            "Твой вклад помогает развивать проект."
-        )
-        logger.info(
-            "Получен донат Telegram Stars: %s XTR",
-            payment.total_amount,
-        )
-
-
 @dp.message(Command("donate"))
 async def donate_command_handler(message: Message):
     if not await require_subscription(message):
@@ -497,8 +492,27 @@ async def donate_command_handler(message: Message):
     )
 
 
+@dp.pre_checkout_query()
+async def pre_checkout_handler(query: PreCheckoutQuery):
+    await query.answer(ok=True)
+
+
+@dp.message(F.successful_payment)
+async def successful_payment_handler(message: Message):
+    payment = message.successful_payment
+
+    if payment and payment.currency == "XTR":
+        logger.info(
+            "Получен донат: %s Stars",
+            payment.total_amount,
+        )
+        await message.answer(
+            "⭐ Спасибо за поддержку VidMorph!"
+        )
+
+
 # ============================================================
-# ОБРАБОТКА ССЫЛОК НА ВИДЕО
+# VIDEO HANDLER
 # ============================================================
 
 @dp.message(F.text)
@@ -514,44 +528,24 @@ async def video_handler(message: Message):
         )
         return
 
-    status_message = await message.answer(
-        "⏳ Скачиваю видео. Пожалуйста, подожди..."
-    )
+    status_message = await message.answer("⏳ Скачиваю видео...")
 
     async with download_semaphore:
-        temp_dir = Path(tempfile.mkdtemp(prefix="vidmorph_"))
+        temp_dir = Path(tempfile.mkdtemp(prefix=TEMP_PREFIX))
 
         try:
-            # yt-dlp и FFmpeg работают в отдельных потоках,
-            # чтобы бот продолжал отвечать другим пользователям.
-            video_path = await asyncio.wait_for(
-                asyncio.to_thread(download_video, url, temp_dir),
-                timeout=DOWNLOAD_TIMEOUT,
+            video_path = await asyncio.to_thread(
+                download_video,
+                url,
+                temp_dir,
             )
-
-            if video_path.stat().st_size > MAX_FILE_SIZE:
-                await status_message.edit_text(
-                    "❌ Видео превышает лимит отправки бота "
-                    "(примерно 49 MB). Попробуй ссылку на видео "
-                    меньшего размера."
-                )
-                return
 
             prepared_path = await asyncio.to_thread(
                 make_telegram_compatible,
                 video_path,
             )
 
-            if prepared_path.stat().st_size > MAX_FILE_SIZE:
-                await status_message.edit_text(
-                    "❌ Подготовленное видео превышает лимит "
-                    "отправки Telegram (примерно 49 MB)."
-                )
-                return
-
-            await status_message.edit_text(
-                "📤 Отправляю видео в Telegram..."
-            )
+            await status_message.edit_text("📤 Отправляю видео...")
 
             await message.answer_video(
                 video=FSInputFile(
@@ -564,49 +558,50 @@ async def video_handler(message: Message):
 
             await status_message.delete()
 
-        except asyncio.TimeoutError:
-            logger.exception("Истекло время ожидания скачивания")
-            await status_message.edit_text(
-                "⌛ Скачивание заняло слишком много времени. "
-                "Попробуй ещё раз."
-            )
-
         except Exception as exc:
-            logger.exception("Ошибка обработки видео")
+            logger.exception("Ошибка скачивания, обработки или отправки")
 
-            error_message = str(exc)
-            if len(error_message) > 500:
-                error_message = error_message[:500] + "..."
+            # Avoid exposing internal server paths in user-facing messages.
+            error_text = str(exc)
+
+            if "предел" in error_text.lower() or "лимит" in error_text.lower():
+                user_error = error_text
+            elif "памяти" in error_text.lower():
+                user_error = error_text
+            elif "слишком много времени" in error_text.lower():
+                user_error = error_text
+            else:
+                user_error = (
+                    "Не удалось обработать это видео. "
+                    "Проверь ссылку или попробуй другой ролик."
+                )
 
             try:
                 await status_message.edit_text(
-                    "❌ Не удалось обработать видео.\n\n"
-                    "Возможные причины: ограничение источника, "
-                    "недоступная ссылка, неподдерживаемый формат "
-                    "или нехватка памяти на хостинге.\n\n"
-                    f"Подробности: {error_message}"
+                    f"❌ {user_error}"
                 )
             except TelegramAPIError:
                 pass
 
         finally:
+            # Remove downloaded and converted files after success or error.
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 # ============================================================
-# ЗАПУСК
+# STARTUP
 # ============================================================
 
 async def main():
+    cleanup_old_temp_dirs()
+
     logger.info("VidMorph запускается")
     logger.info("FFmpeg: %s", shutil.which("ffmpeg"))
     logger.info("FFprobe: %s", shutil.which("ffprobe"))
     logger.info("Deno: %s", shutil.which("deno"))
 
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-        logger.warning(
-            "FFmpeg или FFprobe не найден. Проверь Dockerfile."
-        )
+        logger.warning("FFmpeg или FFprobe не найден. Проверь Dockerfile.")
 
     await bot.delete_webhook(drop_pending_updates=False)
 
@@ -618,4 +613,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
