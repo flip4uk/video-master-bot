@@ -35,7 +35,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
 SUBSCRIBE_URL = os.getenv("SUBSCRIBE_URL", "").strip()
 
-# Лимит отправки файла. Увеличивай только если это позволяет Bot API.
 MAX_FILE_SIZE = 49 * 1024 * 1024
 MAX_CONCURRENT_DOWNLOADS = 2
 
@@ -125,12 +124,14 @@ def donation_keyboard():
         ]
         for amount, description in DONATION_AMOUNTS.items()
     ]
+
     rows.append([
         InlineKeyboardButton(
             text="↩️ В главное меню",
             callback_data="back_to_menu",
         )
     ])
+
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -148,7 +149,7 @@ def donation_back_keyboard():
 
 
 # =====================================
-# ТЕКСТЫ ИНТЕРФЕЙСА
+# ТЕКСТЫ
 # =====================================
 
 WELCOME_TEXT = (
@@ -156,7 +157,7 @@ WELCOME_TEXT = (
     "<i>Твои видео. Твоё качество. Без лишних действий.</i>\n\n"
     "Добро пожаловать!\n"
     "Скачивай видео из <b>YouTube, Instagram и TikTok</b> "
-    "в лучшем доступном качестве, если ссылка и платформа это позволяют.\n\n"
+    "в лучшем доступном качестве, если это позволяет источник.\n\n"
     "🔒 <b>Чтобы начать пользоваться ботом:</b>\n\n"
     "1. Нажми «Подписаться на канал».\n"
     "2. Подпишись на канал.\n"
@@ -168,16 +169,16 @@ MAIN_MENU_TEXT = (
     "🎬 <b>VIDMORPH</b>\n"
     "<i>Твои видео. Твоё качество. Без лишних действий.</i>\n\n"
     "✅ <b>Доступ открыт!</b>\n\n"
-    "Отправь ссылку на видео или нажми кнопку ниже.\n\n"
+    "Отправь ссылку на видео или выбери действие ниже.\n\n"
     "🌐 YouTube · Instagram · TikTok"
 )
 
 DONATION_TEXT = (
     "💖 <b>Поддержать VidMorph</b>\n\n"
-    "Если бот оказался полезен, ты можешь помочь проекту "
-    "развиваться и оплачивать его обслуживание.\n\n"
-    "Выбери удобную сумму в Telegram Stars.\n"
-    "Каждая поддержка важна. Спасибо! ✨"
+    "Твоя поддержка помогает развивать проект "
+    "и оплачивать его обслуживание.\n\n"
+    "Выбери сумму в Telegram Stars.\n"
+    "Спасибо за вклад! ✨"
 )
 
 
@@ -233,8 +234,10 @@ async def require_subscription(message: Message) -> bool:
 
 def extract_url(text: str) -> str | None:
     match = re.search(r"https?://[^\s<>]+", text)
+
     if not match:
         return None
+
     return match.group(0).rstrip(".,!?)]}»'\"")
 
 
@@ -246,6 +249,7 @@ def is_supported_url(url: str) -> bool:
             return False
 
         host = (parsed.hostname or "").lower().rstrip(".")
+
         if host.startswith("www."):
             host = host[4:]
 
@@ -259,7 +263,7 @@ def is_supported_url(url: str) -> bool:
 
 
 # =====================================
-# СКАЧИВАНИЕ ВИДЕО
+# СКАЧИВАНИЕ
 # =====================================
 
 def download_video(url: str, folder: str):
@@ -294,7 +298,8 @@ def download_video(url: str, folder: str):
             path = mp4_path
         else:
             candidates = [
-                file for file in Path(folder).glob("video.*")
+                file
+                for file in Path(folder).glob("video.*")
                 if file.is_file()
             ]
 
@@ -310,12 +315,10 @@ def download_video(url: str, folder: str):
 
 
 # =====================================
-# ПОДГОТОВКА ВИДЕО ДЛЯ IPHONE
+# СОВМЕСТИМОСТЬ С IPHONE
 # =====================================
 
 def make_iphone_compatible(video_path: Path) -> Path:
-    """Оставляет совместимые файлы без перекодирования."""
-
     probe = subprocess.run(
         [
             "ffprobe",
@@ -337,6 +340,7 @@ def make_iphone_compatible(video_path: Path) -> Path:
         for stream in streams
         if stream.get("codec_type") == "video"
     ]
+
     audio_codecs = [
         stream["codec_name"]
         for stream in streams
@@ -345,7 +349,7 @@ def make_iphone_compatible(video_path: Path) -> Path:
 
     compatible = (
         video_path.suffix.lower() == ".mp4"
-        and video_codecs
+        and bool(video_codecs)
         and video_codecs[0] == "h264"
         and (not audio_codecs or audio_codecs[0] == "aac")
     )
@@ -384,7 +388,7 @@ def make_iphone_compatible(video_path: Path) -> Path:
 
 
 # =====================================
-# /START
+# СТАРТ
 # =====================================
 
 @dp.message(CommandStart())
@@ -423,7 +427,7 @@ async def check_subscription_handler(callback: CallbackQuery):
 
 
 # =====================================
-# КНОПКА СКАЧИВАНИЯ
+# СКАЧАТЬ ВИДЕО
 # =====================================
 
 @dp.callback_query(F.data == "download_prompt")
@@ -438,13 +442,13 @@ async def download_prompt_handler(callback: CallbackQuery):
     if callback.message:
         await callback.message.answer(
             "🔗 <b>Отправь ссылку на видео</b>\n\n"
-            "Подойдут ссылки из YouTube, Instagram или TikTok.",
+            "YouTube · Instagram · TikTok",
             reply_markup=main_menu_keyboard(),
         )
 
 
 # =====================================
-# ВОЗВРАТ В ГЛАВНОЕ МЕНЮ
+# ГЛАВНОЕ МЕНЮ
 # =====================================
 
 @dp.callback_query(F.data == "back_to_menu")
@@ -476,7 +480,7 @@ async def back_to_menu_handler(callback: CallbackQuery):
 
 
 # =====================================
-# ДОНАТЫ
+# ПОДДЕРЖАТЬ ПРОЕКТ
 # =====================================
 
 @dp.callback_query(F.data == "donate")
@@ -523,13 +527,15 @@ async def donate_amount_handler(callback: CallbackQuery):
             currency="XTR",
             prices=[
                 LabeledPrice(
-                    label="Добровольная поддержка",
+                    label="Поддержка VidMorph",
                     amount=amount,
                 )
             ],
         )
+
     except TelegramAPIError:
         logger.exception("Не удалось выставить счёт Stars")
+
         if callback.message:
             await callback.message.answer(
                 "Не удалось создать платёж. Попробуй позже.",
@@ -538,7 +544,7 @@ async def donate_amount_handler(callback: CallbackQuery):
 
 
 # =====================================
-# ПЛАТЕЖИ TELEGRAM STARS
+# ОПЛАТА STARS
 # =====================================
 
 @dp.pre_checkout_query()
@@ -575,7 +581,7 @@ async def successful_payment_handler(message: Message):
     payment = message.successful_payment
 
     logger.info(
-        "Успешный Stars-платёж: user_id=%s amount=%s currency=%s charge_id=%s",
+        "Stars-платёж: user_id=%s amount=%s currency=%s charge_id=%s",
         message.from_user.id if message.from_user else None,
         payment.total_amount,
         payment.currency,
@@ -593,8 +599,7 @@ async def successful_payment_handler(message: Message):
 @dp.message(Command("paysupport"))
 async def payment_support_handler(message: Message):
     await message.answer(
-        "Если возник вопрос по донату или платёж прошёл некорректно, "
-        "напиши администратору проекта.\n\n"
+        "По вопросам донатов напиши администратору проекта. "
         "Укажи дату платежа и сумму. Не отправляй пароли или коды."
     )
 
@@ -631,9 +636,7 @@ async def video_handler(message: Message):
     if not await require_subscription(message):
         return
 
-    status_message = await message.answer(
-        "⏳ Получаю видео в лучшем доступном качестве…"
-    )
+    status_message = await message.answer("⏳ Скачиваю видео...")
 
     async with download_semaphore:
         temp_dir = Path(tempfile.mkdtemp(prefix="vidmorph_"))
@@ -646,7 +649,7 @@ async def video_handler(message: Message):
             )
 
             await status_message.edit_text(
-                "🎬 Проверяю совместимость с iPhone…"
+                "🎬 Проверяю совместимость с iPhone..."
             )
 
             video_path = await asyncio.to_thread(
@@ -662,9 +665,10 @@ async def video_handler(message: Message):
                 return
 
             await status_message.edit_text(
-                "✨ Видео готово! Отправляю в видеоплеер Telegram…"
+                "✨ Видео готово! Отправляю в видеоплеер Telegram..."
             )
 
+            # Отправляем как ВИДЕО, а не как документ.
             await message.answer_video(
                 video=FSInputFile(
                     path=str(video_path),
@@ -693,7 +697,7 @@ async def video_handler(message: Message):
 
 
 # =====================================
-# ЗАПУСК БОТА
+# ЗАПУСК
 # =====================================
 
 async def main():
