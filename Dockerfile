@@ -1,26 +1,22 @@
-
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    DENO_INSTALL=/root/.deno \
-    PATH="/root/.deno/bin:${PATH}"
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
 
+# ffmpeg — склейка видео и аудио дорожек
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-       ffmpeg \
-       curl \
-       ca-certificates \
-       unzip \
-    && curl -fsSL https://deno.land/install.sh | sh \
+    && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Deno — JS-рантайм, который yt-dlp использует для YouTube
+# (если сборка на хостинге не поддерживает COPY --from — удалите эту строку)
+COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
 
 WORKDIR /app
 
 COPY requirements.txt .
-
-RUN python -m pip install --upgrade pip \
-    && pip install -r requirements.txt
+RUN pip install -r requirements.txt
 
 COPY . .
 
