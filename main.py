@@ -1,9 +1,11 @@
 import asyncio
 import html
+import json
 import logging
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,9 +36,9 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadCancelled, DownloadError
 
-# ════════════════════════════════════════════════════════════════
-#  НАСТРОЙКИ  (всё можно переопределить переменными окружения)
-# ════════════════════════════════════════════════════════════════
+# ================================================================
+# НАСТРОЙКИ
+# ================================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 BOT_USERNAME = os.getenv("BOT_USERNAME", "FetchRemixDeliverBot").strip().lstrip("@")
 
@@ -46,16 +48,18 @@ if not CHANNEL_USERNAME.startswith("@"):
 CHANNEL_URL = f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}"
 
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", CHANNEL_USERNAME).strip()
-
-# Необязательный файл cookies (формат Netscape) — помогает с Instagram и YouTube
 COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt").strip()
 
-MAX_DURATION = int(os.getenv("MAX_DURATION", "1200"))  # сек. (20 минут)
-MAX_PARALLEL = int(os.getenv("MAX_PARALLEL", "3"))  # одновременных загрузок
-MAX_UPLOAD_BYTES = 49 * 1024 * 1024  # лимит Bot API — 50 МБ, берём с запасом
-QUALITY_LADDER = (720, 480, 360)  # пробуем от лучшего качества к меньшему
-MAX_STARS = 10_000  # максимум Stars в одном счёте
+MAX_DURATION = int(os.getenv("MAX_DURATION", "1200"))
+MAX_PARALLEL = int(os.getenv("MAX_PARALLEL", "3"))
+MAX_UPLOAD_BYTES = 49 * 1024 * 1024
+QUALITY_LADDER = (720, 480, 360)
+MAX_STARS = 10_000
 DONATE_PRESETS = (10, 50, 100, 250, 500, 1000)
+
+# Качество перекодирования. CRF меньше = лучше качество и больше файл.
+FFMPEG_CRF = os.getenv("FFMPEG_CRF", "21")
+FFMPEG_PRESET = os.getenv("FFMPEG_PRESET", "veryfast")
 
 PLATFORMS: dict[str, tuple[str, str]] = {
     "youtube.com": ("YouTube", "▶️"),
@@ -63,7 +67,6 @@ PLATFORMS: dict[str, tuple[str, str]] = {
     "instagram.com": ("Instagram", "📸"),
     "tiktok.com": ("TikTok", "🎵"),
 }
-
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
 logging.basicConfig(
@@ -72,9 +75,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("fetchremix")
 
-# ════════════════════════════════════════════════════════════════
-#  ТЕКСТЫ
-# ════════════════════════════════════════════════════════════════
 WELCOME = (
     "👋 <b>Привет, {name}!</b>\n\n"
     "Я скачиваю видео из <b>YouTube</b>, <b>Instagram</b> и <b>TikTok</b> "
@@ -85,7 +85,6 @@ WELCOME = (
     "3️⃣ Получите готовый файл ⚡\n\n"
     "📎 <i>Просто пришлите ссылку прямо сюда 👇</i>"
 )
-
 HELP = (
     "📖 <b>Как пользоваться ботом</b>\n\n"
     "Отправьте ссылку на видео — остальное я сделаю сам.\n\n"
@@ -100,41 +99,36 @@ HELP = (
     "• Скачивайте только тот контент, на который у вас есть права\n\n"
     "💛 Бот бесплатный. Если он вам полезен — можно поддержать проект звёздами ⭐"
 )
-
 DONATE_TEXT = (
     "⭐ <b>Поддержать проект</b>\n\n"
     "Бот полностью бесплатный, а донаты — <b>исключительно добровольные</b>. "
     "Они помогают оплачивать сервер и развивать бота 💛\n\n"
     "Выберите сумму в Telegram Stars или введите свою 👇"
 )
-
 CUSTOM_AMOUNT_TEXT = (
     "✏️ <b>Своя сумма</b>\n\n"
     f"Отправьте количество звёзд числом — от 1 до {MAX_STARS:,}.".replace(",", " ")
 )
-
 SUBSCRIBE_TEXT = (
     "🔐 <b>Один шаг до скачивания</b>\n\n"
     "Чтобы пользоваться ботом, подпишитесь на наш канал "
     f"<b>{html.escape(CHANNEL_USERNAME)}</b> — там новости и обновления.\n\n"
     "После подписки нажмите <b>«✅ Я подписался»</b> 👇"
 )
-
 NOT_A_LINK = (
     "🔗 <b>Пришлите ссылку на видео</b>\n\n"
     "Я работаю с YouTube, Instagram и TikTok.\n"
     "<i>Например: https://www.tiktok.com/@user/video/123…</i>"
 )
-
 UNSUPPORTED = (
     "🤔 <b>Эта ссылка не поддерживается</b>\n\n"
     "Я умею скачивать только с <b>YouTube</b>, <b>Instagram</b> и <b>TikTok</b>."
 )
 
 
-# ════════════════════════════════════════════════════════════════
-#  КЛАВИАТУРЫ
-# ════════════════════════════════════════════════════════════════
+# ================================================================
+# КЛАВИАТУРЫ
+# ================================================================
 def main_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="📖 Как пользоваться", callback_data="help")
@@ -182,9 +176,9 @@ def after_download_kb() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-# ════════════════════════════════════════════════════════════════
-#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ════════════════════════════════════════════════════════════════
+# ================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ================================================================
 async def safe_edit(
     message: Message, text: str, reply_markup: InlineKeyboardMarkup | None = None
 ) -> None:
@@ -198,7 +192,6 @@ async def safe_edit(
 async def show_screen(
     call: CallbackQuery, text: str, reply_markup: InlineKeyboardMarkup | None = None
 ) -> None:
-    """Редактирует текущее сообщение, а если это не текст (например, видео) — шлёт новое."""
     msg = call.message
     if msg is None:
         return
@@ -214,8 +207,7 @@ async def is_subscribed(bot: Bot, user_id: int) -> bool:
     except TelegramAPIError as e:
         log.error(
             "Не удалось проверить подписку (бот должен быть администратором канала %s): %s",
-            CHANNEL_USERNAME,
-            e,
+            CHANNEL_USERNAME, e,
         )
         return False
     if member.status in (
@@ -255,9 +247,9 @@ def extract_url(message: Message) -> str | None:
     return url
 
 
-# ════════════════════════════════════════════════════════════════
-#  ЗАГРУЗКА ВИДЕО (yt-dlp)
-# ════════════════════════════════════════════════════════════════
+# ================================================================
+# СКАЧИВАНИЕ И ПОДГОТОВКА ВИДЕО
+# ================================================================
 @dataclass
 class DownloadResult:
     path: Path
@@ -268,8 +260,6 @@ class DownloadResult:
 
 
 class DownloadFailed(Exception):
-    """Ошибка с готовым текстом для пользователя."""
-
     def __init__(self, user_message: str) -> None:
         super().__init__(user_message)
         self.user_message = user_message
@@ -301,10 +291,18 @@ def _duration_filter(info: dict, *, incomplete: bool = False) -> None:
     return None
 
 
-def _format_for(height: int, last: bool) -> str:
-    h = f"[height<=?{height}]"
-    fmt = f"bv*{h}[ext=mp4]+ba[ext=m4a]/b{h}[ext=mp4]/bv*{h}+ba/b{h}"
-    return fmt + "/w" if last else fmt
+def _format_for(height: int) -> str:
+    # Приоритет H.264/AVC с M4A-аудио; если платформа не даёт такого
+    # потока, скачиваем доступный формат и при необходимости перекодируем.
+    h = f"[height<={height}]"
+    h264 = "[vcodec~='^(avc1|h264)']"
+    return (
+        f"bv*{h}{h264}+ba[ext=m4a]"
+        f"/b{h}{h264}[ext=mp4]"
+        f"/bv*{h}{h264}+ba"
+        f"/b{h}{h264}"
+        f"/bv*{h}+ba/b{h}"
+    )
 
 
 def _find_file(info: dict[str, Any], workdir: Path) -> Path | None:
@@ -313,22 +311,132 @@ def _find_file(info: dict[str, Any], workdir: Path) -> Path | None:
         if p and Path(p).is_file():
             return Path(p)
     candidates = [
-        p for p in workdir.iterdir() if p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}
+        p for p in workdir.iterdir()
+        if p.is_file() and p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}
+        and p.name != "cookies.txt"
     ]
     return max(candidates, key=lambda p: p.stat().st_size, default=None)
 
 
+def _probe_media(path: Path) -> dict[str, Any]:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise RuntimeError("ffprobe не найден")
+    result = subprocess.run(
+        [
+            ffprobe, "-v", "error",
+            "-show_streams", "-show_format",
+            "-of", "json", str(path),
+        ],
+        capture_output=True, text=True, timeout=45, check=True,
+    )
+    return json.loads(result.stdout)
+
+
+def _transcode_or_remux(path: Path, workdir: Path, max_bytes: int) -> Path:
+    """
+    Возвращает MP4 с H.264/yuv420p и AAC.
+    Совместимые потоки копируются без потери качества; неподходящие перекодируются.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg or not shutil.which("ffprobe"):
+        raise DownloadFailed(
+            "⚠️ <b>На сервере не найден FFmpeg/FFprobe.</b>\n"
+            "Проверьте сборку Docker-контейнера."
+        )
+
+    try:
+        data = _probe_media(path)
+    except (subprocess.SubprocessError, OSError, ValueError, RuntimeError) as e:
+        log.warning("Не удалось определить кодеки: %s", e)
+        # Не отправляем непроверенный файл как гарантированно совместимый.
+        raise DownloadFailed(
+            "😔 <b>Не удалось проверить формат видео.</b>\nПопробуйте другую ссылку."
+        ) from e
+
+    streams = data.get("streams", [])
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    if video is None:
+        raise DownloadFailed("❌ <b>В скачанном файле не найден видеопоток.</b>")
+
+    compatible = (
+        video.get("codec_name") == "h264"
+        and video.get("pix_fmt") == "yuv420p"
+        and (audio is None or audio.get("codec_name") == "aac")
+    )
+
+    # Если уже совместимый MP4, достаточно переместить moov atom в начало.
+    # Для других контейнеров/кодеков создаём новую MP4-версию.
+    output = workdir / f"{path.stem}_iphone.mp4"
+    if compatible and path.suffix.lower() == ".mp4":
+        command = [
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(path), "-map", "0:v:0", "-map", "0:a?",
+            "-c", "copy", "-movflags", "+faststart", str(output),
+        ]
+        action = "remux/copy"
+    else:
+        log.info(
+            "Подготовка iPhone MP4: video=%s profile=%s pix_fmt=%s audio=%s",
+            video.get("codec_name"), video.get("profile"), video.get("pix_fmt"),
+            audio.get("codec_name") if audio else "нет",
+        )
+        command = [
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(path),
+            "-map", "0:v:0", "-map", "0:a?",
+            "-c:v", "libx264", "-preset", FFMPEG_PRESET,
+            "-crf", FFMPEG_CRF, "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            str(output),
+        ]
+        action = "transcode"
+
+    try:
+        proc = subprocess.run(
+            command, capture_output=True, text=True, timeout=600, check=True,
+        )
+        if not output.is_file() or output.stat().st_size == 0:
+            raise RuntimeError("FFmpeg создал пустой файл")
+        if output.stat().st_size > max_bytes:
+            output.unlink(missing_ok=True)
+            raise DownloadFailed(
+                "📦 <b>После подготовки видео превышен лимит Telegram (49 МБ).</b>\n"
+                "Попробуйте более короткое видео."
+            )
+        log.info(
+            "Видео подготовлено (%s), размер %.2f МБ",
+            action, output.stat().st_size / 1048576,
+        )
+        return output
+    except DownloadFailed:
+        raise
+    except (subprocess.SubprocessError, OSError, RuntimeError) as e:
+        output.unlink(missing_ok=True)
+        details = getattr(e, "stderr", None)
+        if details:
+            log.error("FFmpeg error: %s", details[-2500:])
+        else:
+            log.error("FFmpeg error: %s", e)
+        raise DownloadFailed(
+            "😔 <b>Не удалось подготовить видео для iPhone.</b>\n"
+            "Попробуйте другую ссылку позже."
+        ) from e
+
+
 def download_video(url: str, workdir: Path) -> DownloadResult:
-    """Блокирующая функция — запускать через asyncio.to_thread."""
+    """Блокирующая функция; вызывается через asyncio.to_thread."""
     cookies: Path | None = None
     if COOKIES_FILE and os.path.isfile(COOKIES_FILE):
         cookies = workdir / "cookies.txt"
         shutil.copyfile(COOKIES_FILE, cookies)
 
-    for idx, height in enumerate(QUALITY_LADDER):
-        last = idx == len(QUALITY_LADDER) - 1
+    last_error: Exception | None = None
+    for height in QUALITY_LADDER:
         opts: dict[str, Any] = {
-            "format": _format_for(height, last),
+            "format": _format_for(height),
             "outtmpl": str(workdir / "%(id).60B.%(ext)s"),
             "merge_output_format": "mp4",
             "noplaylist": True,
@@ -355,40 +463,75 @@ def download_video(url: str, workdir: Path) -> DownloadResult:
                 ) from e
             raise DownloadFailed(_humanize_error(str(msg))) from e
         except DownloadError as e:
-            log.warning("yt-dlp error for %s: %s", url, e)
-            raise DownloadFailed(_humanize_error(str(e))) from e
+            log.warning("yt-dlp error at <=%sp for %s: %s", height, url, e)
+            last_error = e
+            continue
 
-        if info and "entries" in info:  # карусели / плейлисты — берём первый элемент
-            entries = [e for e in info["entries"] if e]
+        if info and "entries" in info:
+            entries = [entry for entry in info["entries"] if entry]
             info = entries[0] if entries else None
         if not info:
             raise DownloadFailed("🖼 <b>В этой публикации нет видео.</b>")
 
         path = _find_file(info, workdir)
         if path is None:
-            raise DownloadFailed(_humanize_error("no video"))
+            last_error = RuntimeError("Downloaded file not found")
+            continue
 
-        if path.stat().st_size <= MAX_UPLOAD_BYTES:
-            return DownloadResult(
-                path=path,
-                title=(info.get("title") or "Видео").strip(),
-                duration=int(info["duration"]) if info.get("duration") else None,
-                width=info.get("width"),
-                height=info.get("height"),
+        # Подготовка к iPhone выполняется до проверки лимита: перекодированный
+        # файл тоже должен помещаться в лимит отправки.
+        try:
+            final_path = _transcode_or_remux(path, workdir, MAX_UPLOAD_BYTES)
+        except DownloadFailed as e:
+            if "превышен лимит" in e.user_message and height != QUALITY_LADDER[-1]:
+                log.info("Файл после обработки больше лимита, пробую качество <=%sp", height)
+                # Удаляем текущие файлы, чтобы следующий проход не выбрал старый файл.
+                for candidate in workdir.iterdir():
+                    if candidate.is_file() and candidate.name != "cookies.txt":
+                        candidate.unlink(missing_ok=True)
+                continue
+            raise
+
+        # После успешной подготовки удаляем исходник, если он отличается.
+        if final_path != path:
+            path.unlink(missing_ok=True)
+
+        try:
+            final_info = _probe_media(final_path)
+            final_video = next(
+                s for s in final_info.get("streams", [])
+                if s.get("codec_type") == "video"
             )
+            width = final_video.get("width")
+            height_out = final_video.get("height")
+            duration_raw = final_info.get("format", {}).get("duration")
+            duration = int(float(duration_raw)) if duration_raw else (
+                int(info["duration"]) if info.get("duration") else None
+            )
+        except Exception:
+            width = info.get("width")
+            height_out = info.get("height")
+            duration = int(info["duration"]) if info.get("duration") else None
 
-        log.info("Файл %.1f МБ больше лимита, снижаю качество (<= %sp)", path.stat().st_size / 1048576, height)
-        path.unlink(missing_ok=True)
+        return DownloadResult(
+            path=final_path,
+            title=(info.get("title") or "Видео").strip(),
+            duration=duration,
+            width=width,
+            height=height_out,
+        )
 
+    if last_error:
+        raise DownloadFailed(_humanize_error(str(last_error))) from last_error
     raise DownloadFailed(
-        "📦 <b>Файл слишком большой</b> для отправки в Telegram (лимит — 50 МБ).\n"
-        "Попробуйте более короткое видео."
+        "📦 <b>Не удалось получить видео подходящего размера.</b>\n"
+        "Попробуйте более короткий ролик."
     )
 
 
-# ════════════════════════════════════════════════════════════════
-#  MIDDLEWARE: обязательная подписка на канал
-# ════════════════════════════════════════════════════════════════
+# ================================================================
+# MIDDLEWARE: ОБЯЗАТЕЛЬНАЯ ПОДПИСКА
+# ================================================================
 class SubscriptionMiddleware(BaseMiddleware):
     async def __call__(
         self,
@@ -399,7 +542,6 @@ class SubscriptionMiddleware(BaseMiddleware):
         bot: Bot = data["bot"]
         user = data.get("event_from_user")
 
-        # Пропускаем: служебные случаи и не-личные чаты
         if user is None or user.is_bot:
             return await handler(event, data)
         if isinstance(event, CallbackQuery):
@@ -408,10 +550,11 @@ class SubscriptionMiddleware(BaseMiddleware):
                 return await handler(event, data)
         elif isinstance(event, Message):
             chat = event.chat
-            if event.successful_payment:  # оплата уже прошла — обработать обязательно
+            if event.successful_payment:
                 return await handler(event, data)
         else:
             return await handler(event, data)
+
         if chat is None or chat.type != ChatType.PRIVATE:
             return await handler(event, data)
 
@@ -427,9 +570,9 @@ class SubscriptionMiddleware(BaseMiddleware):
         return None
 
 
-# ════════════════════════════════════════════════════════════════
-#  ХЕНДЛЕРЫ
-# ════════════════════════════════════════════════════════════════
+# ================================================================
+# ХЕНДЛЕРЫ
+# ================================================================
 router = Router(name="main")
 router.message.filter(F.chat.type == ChatType.PRIVATE)
 router.callback_query.filter(F.message.chat.type == ChatType.PRIVATE)
@@ -446,7 +589,6 @@ def _welcome_for(user_name: str | None) -> str:
     return WELCOME.format(name=html.escape(user_name or "друг"))
 
 
-# ── Команды ──────────────────────────────────────────────────────
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -475,7 +617,6 @@ async def cmd_paysupport(message: Message) -> None:
     )
 
 
-# ── Подписка ─────────────────────────────────────────────────────
 @router.callback_query(F.data == "check_sub")
 async def cb_check_sub(call: CallbackQuery, bot: Bot) -> None:
     if await is_subscribed(bot, call.from_user.id):
@@ -485,7 +626,6 @@ async def cb_check_sub(call: CallbackQuery, bot: Bot) -> None:
         await call.answer("❌ Вы ещё не подписались на канал", show_alert=True)
 
 
-# ── Навигация ────────────────────────────────────────────────────
 @router.callback_query(F.data == "menu")
 async def cb_menu(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
@@ -499,13 +639,12 @@ async def cb_help(call: CallbackQuery) -> None:
     await call.answer()
 
 
-# ── Донаты в Telegram Stars ──────────────────────────────────────
 async def send_donation_invoice(message: Message, amount: int) -> None:
     await message.answer_invoice(
         title="Поддержка проекта ⭐",
         description=f"Добровольный донат {amount} ⭐ на развитие бота. Спасибо, что вы с нами!",
         payload=f"donate:{amount}",
-        currency="XTR",  # Telegram Stars
+        currency="XTR",
         prices=[LabeledPrice(label="Донат", amount=amount)],
     )
 
@@ -554,9 +693,7 @@ async def on_paid(message: Message) -> None:
     payment = message.successful_payment
     log.info(
         "Stars donation: user=%s amount=%s %s charge_id=%s",
-        message.from_user.id,
-        payment.total_amount,
-        payment.currency,
+        message.from_user.id, payment.total_amount, payment.currency,
         payment.telegram_payment_charge_id,
     )
     await message.answer(
@@ -567,8 +704,9 @@ async def on_paid(message: Message) -> None:
     )
 
 
-# ── Скачивание ───────────────────────────────────────────────────
-async def process_link(message: Message, bot: Bot, url: str, platform: tuple[str, str]) -> None:
+async def process_link(
+    message: Message, bot: Bot, url: str, platform: tuple[str, str]
+) -> None:
     user_id = message.from_user.id
     name, icon = platform
 
@@ -577,17 +715,21 @@ async def process_link(message: Message, bot: Bot, url: str, platform: tuple[str
         return
     ACTIVE_USERS.add(user_id)
 
-    status = await message.answer(f"{icon} <b>Ссылка принята</b> · {name}\n<i>Готовлюсь к загрузке…</i>")
+    status = await message.answer(
+        f"{icon} <b>Ссылка принята</b> · {name}\n<i>Готовлюсь к загрузке…</i>"
+    )
     try:
         if DOWNLOAD_SEMAPHORE.locked():
             await safe_edit(status, "🕐 <b>Вы в очереди</b>\n<i>Начну, как только освободится место…</i>")
 
         async with DOWNLOAD_SEMAPHORE:
-            await safe_edit(status, f"📥 <b>Скачиваю видео…</b>\n<i>{icon} {name} · это займёт несколько секунд</i>")
+            await safe_edit(
+                status,
+                f"📥 <b>Скачиваю видео…</b>\n<i>{icon} {name} · это займёт несколько секунд</i>",
+            )
             async with ChatActionSender.upload_video(bot=bot, chat_id=message.chat.id):
                 with tempfile.TemporaryDirectory(prefix="fetch_") as tmp:
                     result = await asyncio.to_thread(download_video, url, Path(tmp))
-
                     await safe_edit(status, "📤 <b>Отправляю…</b>")
                     title = html.escape(result.title[:150])
                     await message.answer_video(
@@ -634,12 +776,11 @@ async def on_other(message: Message) -> None:
     await message.answer(NOT_A_LINK, reply_markup=back_kb())
 
 
-# ════════════════════════════════════════════════════════════════
-#  ЗАПУСК
-# ════════════════════════════════════════════════════════════════
+# ================================================================
+# ЗАПУСК
+# ================================================================
 async def on_startup(bot: Bot) -> None:
     await bot.delete_webhook(drop_pending_updates=True)
-
     await bot.set_my_commands(
         [
             BotCommand(command="start", description="🚀 Запустить бота"),
@@ -647,7 +788,9 @@ async def on_startup(bot: Bot) -> None:
             BotCommand(command="donate", description="⭐ Поддержать проект"),
         ]
     )
-    await bot.set_my_short_description("📥 Скачиваю видео из YouTube, Instagram и TikTok. Бесплатно и быстро!")
+    await bot.set_my_short_description(
+        "📥 Скачиваю видео из YouTube, Instagram и TikTok. Бесплатно и быстро!"
+    )
     await bot.set_my_description(
         "📥 Скачиваю видео из YouTube, Instagram и TikTok в лучшем качестве.\n\n"
         "Просто отправьте ссылку — и получите готовый файл ⚡\n"
@@ -657,11 +800,13 @@ async def on_startup(bot: Bot) -> None:
     me = await bot.get_me()
     log.info("Бот запущен: @%s", me.username)
 
-    # Проверка, что бот может читать список подписчиков канала
     try:
         member = await bot.get_chat_member(CHANNEL_USERNAME, me.id)
         if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
-            log.warning("Бот НЕ администратор канала %s — проверка подписки работать не будет!", CHANNEL_USERNAME)
+            log.warning(
+                "Бот НЕ администратор канала %s — проверка подписки работать не будет!",
+                CHANNEL_USERNAME,
+            )
     except TelegramAPIError as e:
         log.warning("Нет доступа к каналу %s: %s. Добавьте бота в администраторы канала.", CHANNEL_USERNAME, e)
 
@@ -672,15 +817,16 @@ async def main() -> None:
 
     bot = Bot(
         token=BOT_TOKEN,
-        session=AiohttpSession(timeout=300),  # загрузка видео до 50 МБ может быть долгой
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML, link_preview_is_disabled=True),
+        session=AiohttpSession(timeout=300),
+        default=DefaultBotProperties(
+            parse_mode=ParseMode.HTML,
+            link_preview_is_disabled=True,
+        ),
     )
     dp = Dispatcher(storage=MemoryStorage())
-
     subscription = SubscriptionMiddleware()
     router.message.outer_middleware(subscription)
     router.callback_query.outer_middleware(subscription)
-
     dp.include_router(router)
     dp.startup.register(on_startup)
 
